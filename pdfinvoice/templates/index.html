@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF-factuur &rarr; UBL (SI-UBL 2.0)</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body data-mail-available="{{ 'yes' if mail_available else 'no' }}">
+  <header class="bar">
+    <div>
+      <h1>PDF-factuur &rarr; UBL</h1>
+      <p class="sub">SI-UBL 2.0 (NLCIUS) voor Exact. Tekstherkenning en regels &mdash; draait lokaal, zonder model of internetverbinding.</p>
+    </div>
+    <div class="opts">
+      <label>Datumnotatie
+        <select id="date-order">
+          <option value="dmy" selected>03/04 = 3 april</option>
+          <option value="mdy">03/04 = 4 maart</option>
+        </select>
+      </label>
+      <label>Valuta
+        <input id="currency" value="EUR" maxlength="3" size="3"
+               title="Wordt gebruikt in de UBL als de factuur zelf geen valuta noemt">
+      </label>
+      <label>OCR
+        <select id="ocr" {% if not ocr_available %}disabled title="ocrmypdf is niet geïnstalleerd"{% endif %}>
+          <option value="auto" selected>Automatisch</option>
+          <option value="never">Nooit</option>
+          <option value="always">Altijd</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <main>
+    <form id="drop" class="drop">
+      <input type="file" id="picker" accept="application/pdf,.pdf" multiple hidden>
+      <p class="drop-title">Sleep factuur-PDF&rsquo;s hierheen</p>
+      <p class="drop-sub">of <button type="button" id="browse" class="link">kies bestanden</button> &mdash; meerdere tegelijk mag</p>
+    </form>
+
+    <section id="status" class="status" hidden></section>
+
+    <section id="toolbar" class="toolbar" hidden>
+      <span id="summary" class="summary"></span>
+      <span class="spacer"></span>
+      <label class="mail-to">Mailen naar
+        <input id="mail-to" type="email" value="{{ mail_to }}" size="24"
+               {% if not mail_available %}disabled
+               title="Alleen op macOS met Apple Mail"{% endif %}>
+      </label>
+      <button type="button" data-download="ubl">Alle UBL downloaden</button>
+      <button type="button" data-download="csv">CSV downloaden</button>
+      <button type="button" data-download="json">JSON downloaden</button>
+      <button type="button" id="clear" class="ghost">Wissen</button>
+    </section>
+
+    <section id="results"></section>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
