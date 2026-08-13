@@ -22,7 +22,7 @@ pdfinvoice-web = "pdfinvoice.web:main"
 packages = ["pdfinvoice"]
 
 [tool.setuptools.package-data]
-pdfinvoice = ["templates/*.html", "static/*"]
+pdfinvoice = ["templates/*.html", "static/*", "kvk_names.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

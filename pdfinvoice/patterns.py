@@ -52,7 +52,7 @@ LABELS = {
         r"customer\s*(?:no\.?|nr\.?|number|id|#)",
         r"client\s*(?:no\.?|number)",
         r"klant\s*(?:nummer|nr\.?|code)",
-        r"debiteuren?\s*(?:nummer|nr\.?)",
+        r"debiteur(?:en)?\s*(?:nummer|nr\.?)",
         r"kunden\s*(?:nummer|nr\.?)",
     ],
 }
@@ -60,15 +60,28 @@ LABELS = {
 # Totals are classified per line rather than looked up by label, because the
 # same words appear in several buckets ("Total excl. VAT" is a net total, not a
 # grand total, and "Total incl. VAT" is not a VAT amount). Checked in order.
+
+# A totals block does not always name the total: "Excl. BTW 2.777,75" over
+# "Totaal BTW 583,33" is a net line and a VAT line, and without these the first
+# is read as a VAT amount because it too says "BTW", which swaps the two.
+# The rate is often printed in between: "Excl. 21% BTW".
+_VAT_WORD = (
+    r"(?:\d{1,2}(?:[.,]\d{1,2})?\s*%\s*)?"
+    r"(?:btw|vat|tax|mwst\.?|ust\.?|omzetbelasting|mehrwertsteuer)"
+)
+_EXCLUDING = r"\b(?:excl\.?|exclusief|excluding|zzgl\.?|zuz(?:ü|ue)glich)"
+_INCLUDING = r"\b(?:incl\.?|inclusief|including|inkl\.?)"
 NET_TOTAL_RE = re.compile(
     r"sub\s*total|subtotaal|zwischensumme|grondslag|"
     r"(?:total|totaal|amount|bedrag)[\w.\s]{0,12}?"
     r"(?:excl|ex\.|excluding|exclusief|without|before)|"
+    rf"{_EXCLUDING}\s*{_VAT_WORD}|"
     r"\bnet(?:to)?\b(?:\s*(?:amount|total|bedrag|betrag))?",
     re.IGNORECASE,
 )
 GROSS_TOTAL_RE = re.compile(
     r"(?:total|totaal|amount|bedrag)[\w.\s]{0,12}?(?:incl|including|inclusief)|"
+    rf"{_INCLUDING}\s*{_VAT_WORD}|"
     r"amount\s*due|balance\s*due|grand\s*total|total\s*payable|"
     r"te\s*betalen(?:\s*bedrag)?|gesamt(?:betrag|summe)?|endbetrag",
     re.IGNORECASE,
@@ -89,6 +102,15 @@ TAX_RATE_RE = re.compile(
 IBAN_RE = re.compile(
     r"\b([A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}[ ]?[A-Z0-9]{1,4})\b"
 )
+# What follows an "IBAN:" label, whatever shape it is in. OCR turns the check
+# digits of "NL50 INGB ..." into letters ("NLSO"), which IBAN_RE cannot match;
+# the label says an account number is there even when it no longer looks like
+# one. The value is cut at a separator, since letterheads print several fields
+# on a line ("Iban: NL50 ... | Bic: INGBNL2A").
+IBAN_LABEL_RE = re.compile(
+    r"\biban\b\s*(?:nr\.?|no\.?|number|nummer)?\s*[:#]?\s*([A-Z0-9][A-Z0-9 ]{13,40})",
+    re.IGNORECASE,
+)
 BIC_RE = re.compile(r"\b([A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b")
 VAT_ID_RE = re.compile(
     r"\b(ATU\d{8}|BE0?\d{9,10}|BG\d{9,10}|CY\d{8}[A-Z]|CZ\d{8,10}|"
@@ -99,7 +121,7 @@ VAT_ID_RE = re.compile(
 )
 # "Registration number" is what a company register id is called on an invoice
 # printed in English; on a Dutch invoice that is the KvK number.
-COC_RE = re.compile(r"(?:kvk|k\.v\.k\.|chamber\s*of\s*commerce|handelsregister|"
+COC_RE = re.compile(r"(?:\bk\.?v\.?k\.?|chamber\s*of\s*commerce|handelsregister|"
                     r"registration\s*(?:number|no\.?|nr\.?)|"
                     r"company\s*(?:registration|number))"
                     r"[^\d\n]{0,15}(\d{6,10})", re.IGNORECASE)

@@ -2,10 +2,11 @@ from datetime import date
 
 import pdfinvoice
 from pdfinvoice.model import Invoice
-from pdfinvoice.parser import (_assign_vat_numbers, _find_vat_ids,
+from pdfinvoice.parser import (_assign_vat_numbers, _find_iban, _find_vat_ids,
                                _guess_supplier_block, _items_from_text,
-                               _looks_like_labelled_field, _overlapping_segment,
-                               _segments, _split_name_from_address)
+                               _letterhead_pieces, _looks_like_labelled_field,
+                               _overlapping_segment, _segments,
+                               _split_name_from_address, _strip_trailing_label)
 from pdfinvoice.textio import Document
 
 
@@ -110,6 +111,64 @@ def test_inconsistent_totals_are_flagged():
     assert any("do not add up" in w for w in inv.warnings)
 
 
+def test_unprefixed_excl_btw_is_a_net_total_not_a_vat_amount():
+    """A garage invoice sets its totals block without naming the total:
+
+        Excl. BTW    2.777,75
+        Totaal BTW     583,33
+        Te betalen   3.361,08
+
+    "Excl. BTW" says BTW, so it used to be read as the VAT amount, and the net
+    total was then derived as gross - net: the two ended up swapped.
+    """
+    inv = pdfinvoice.parse(_doc(
+        "Factuurnummer : 26001434\n"
+        "Factuurdatum : 22-07-2026\n"
+        "Excl. BTW 2.777,75\n"
+        "Totaal BTW 583,33\n"
+        "Te betalen € 3.361,08\n"
+    ))
+    assert inv.total_net == 2777.75
+    assert inv.total_tax == 583.33
+    assert inv.total_gross == 3361.08
+
+
+def test_incl_btw_on_its_own_is_the_gross_total():
+    inv = pdfinvoice.parse(_doc(
+        "Factuurnummer : B1\n"
+        "Factuurdatum : 01-02-2026\n"
+        "Excl. 21% BTW 100,00\n"
+        "Incl. BTW 121,00\n"
+    ))
+    assert (inv.total_net, inv.total_gross) == (100.0, 121.0)
+
+
+def test_tax_rate_is_derived_when_the_invoice_never_prints_a_percent_sign():
+    """A VAT summary table puts the rate in a column, without its "%"."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurnummer : B2\n"
+        "Factuurdatum : 01-02-2026\n"
+        "Btwcode % Grondslag BTW Bedrag\n"
+        "1 21,00 € 2.777,75 € 583,33\n"
+        "Excl. BTW 2.777,75\n"
+        "Totaal BTW 583,33\n"
+        "Te betalen € 3.361,08\n"
+    ))
+    assert inv.tax_rate == 21.0
+
+
+def test_a_blended_rate_is_not_mistaken_for_a_real_one():
+    """Two rates on one invoice divide out to a rate nobody charges."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurnummer : B3\n"
+        "Factuurdatum : 01-02-2026\n"
+        "Excl. BTW 1.000,00\n"
+        "Totaal BTW 155,00\n"
+        "Te betalen € 1.155,00\n"
+    ))
+    assert inv.tax_rate is None
+
+
 def test_vat_number_is_found_next_to_a_worded_label():
     """Space-stripping the whole document hid "VAT number NL123456789B01":
     the number no longer began at a word boundary."""
@@ -175,6 +234,133 @@ def test_customer_vat_number_is_not_given_to_the_supplier():
 
     assert inv.supplier.vat_number == "NL987654321B01"
     assert inv.customer.vat_number == "NL111222333B01"
+
+
+def _column_doc(rows) -> Document:
+    """A Document whose rows carry positions, one segment per row."""
+    from pathlib import Path
+
+    words = [
+        [{"text": text, "x0": x0, "x1": x0 + 6 * len(text), "top": top}]
+        for text, x0, top in rows
+    ]
+    return Document(
+        path=Path("letterhead.pdf"),
+        pages=["\n".join(text for text, _, _ in rows)],
+        word_rows=[words],
+    )
+
+
+# The letterhead of an invoice printed on scanned stationery, as OCR returns
+# it: contact details around a company name that is a logo and stays unread.
+_STATIONERY = [
+    ("Omroepweg 15, 1324 KT Almere | Tel. 036 534 65 50", 31, 10),
+    ("Iban: NL50 INGB 0006 8780 69 | Bic: INGBNL2A", 31, 22),
+    ("K.V.K 77731964 | BTW Nr. NL 861114681B01", 31, 34),
+    ("Info@garageroos.nl | www.garageroos.nl", 31, 46),
+    ("Dhr. F. Ochse", 87, 100),
+    ("Land in Zicht 9", 87, 112),
+    ("1316 VJ ALMERE", 87, 124),
+    ("Factuurnummer : 26001434", 25, 150),
+    ("Factuurdatum : 22-07-2026", 25, 162),
+]
+
+
+def test_a_letterhead_without_a_name_is_still_the_supplier():
+    """The company name is a logo, so OCR reads the address around it and not
+    the name. Reporting that address as the supplier's is what keeps the
+    addressee below it from being taken for the company."""
+    inv = pdfinvoice.parse(_column_doc(_STATIONERY))
+
+    assert inv.supplier.address == ["Omroepweg 15, 1324 KT Almere"]
+    assert inv.supplier.coc_number == "77731964"
+    assert inv.supplier.vat_number == "NL861114681B01"
+    assert inv.supplier.iban == "NL50INGB0006878069"
+    assert inv.supplier.bic == "INGBNL2A"
+
+
+def test_the_addressee_is_the_customer_when_nothing_labels_it():
+    """A Dutch invoice prints no "Factuuradres": the customer is the block in
+    the window-envelope position, above the labelled fields."""
+    inv = pdfinvoice.parse(_column_doc(_STATIONERY))
+
+    assert inv.customer.name == "Dhr. F. Ochse"
+    assert inv.customer.address == ["Land in Zicht 9", "1316 VJ ALMERE"]
+
+
+def _unregistered(rows):
+    """The same letterhead, under a KvK number no name file knows."""
+    return [(text.replace("77731964", "99999999"), x0, top)
+            for text, x0, top in rows]
+
+
+def test_a_logo_only_name_stays_empty_until_the_number_is_written_down():
+    """The name is drawn, not typed, and nothing left on the page is it — the
+    web address only resembles it. An empty field that names the number to add
+    beats a plausible guess: "garageroos.nl" is Garagebedrijf Roos B.V."""
+    inv = pdfinvoice.parse(_column_doc(_unregistered(_STATIONERY)))
+
+    assert inv.supplier.name is None
+    assert any("add KvK 99999999 to the name file" in w for w in inv.warnings)
+
+
+def test_a_printed_company_name_is_used_when_the_register_has_none():
+    printed = [("Voorbeeld BV", 31, 10), ("www.garageroos.nl", 31, 22)]
+    rows = _unregistered(printed + _STATIONERY[4:])
+    inv = pdfinvoice.parse(_column_doc(rows))
+
+    assert inv.supplier.name == "Voorbeeld BV"
+    assert not any("name file" in w for w in inv.warnings)
+
+
+def test_the_registered_name_beats_what_the_invoice_prints():
+    """The garage trades as Roos; the register books it as Garagebedrijf Roos
+    B.V., and that is the name Exact has to see."""
+    inv = pdfinvoice.parse(_column_doc(_STATIONERY))
+
+    assert inv.supplier.name == "Garagebedrijf Roos B.V."
+    # Derived from the web address it is not, so it is not reported as such.
+    assert not any("web address" in w for w in inv.warnings)
+
+
+def test_replacing_a_printed_name_with_the_registered_one_is_reported():
+    printed = [("Garage Roos", 31, 10)] + _STATIONERY[1:]
+    inv = pdfinvoice.parse(_column_doc(printed))
+
+    assert inv.supplier.name == "Garagebedrijf Roos B.V."
+    assert any("replaced by the registered name" in w for w in inv.warnings)
+
+
+def test_a_name_that_differs_only_in_punctuation_is_not_reported():
+    printed = [("Garagebedrijf Roos BV", 31, 10)] + _STATIONERY[1:]
+    inv = pdfinvoice.parse(_column_doc(printed))
+
+    assert inv.supplier.name == "Garagebedrijf Roos B.V."
+    assert not any("replaced by" in w for w in inv.warnings)
+
+
+def test_letterhead_contact_details_are_not_part_of_the_address():
+    assert _letterhead_pieces(
+        "Omroepweg 15, 1324 KT Almere | Tel. 036 534 65 50"
+    ) == ["Omroepweg 15, 1324 KT Almere"]
+    assert _letterhead_pieces("Iban: NL50 INGB 0006 8780 69 | Bic: INGBNL2A") == []
+    assert _letterhead_pieces("Voorbeeld BV") == ["Voorbeeld BV"]
+
+
+def test_an_ocr_misread_iban_is_repaired_when_the_checksum_settles_it():
+    """Tesseract reads the check digits of "NL50 INGB ..." as letters."""
+    assert _find_iban("Iban: NLSO INGB 0006 8780 69") == "NL50INGB0006878069"
+    # Nothing a swap can make valid: left unread rather than guessed at.
+    assert _find_iban("Iban: NLXX QQQQ 1111 2222 33") is None
+    assert _find_iban("IBAN NL91 ABNA 0417 1643 00") == "NL91ABNA0417164300"
+
+
+def test_a_second_column_label_ends_the_value():
+    """"Factuurnummer : 26001434 Kenteken : 1-XHK-91" is two columns, and the
+    gap between them does not always survive text extraction."""
+    assert _strip_trailing_label("26001434 Kenteken : 1-XHK-91") == "26001434"
+    assert _strip_trailing_label("1487 APK geldig tot : 22 aug 2027") == "1487"
+    assert _strip_trailing_label("26001434") == "26001434"
 
 
 def test_a_labelled_field_is_not_a_company_name():

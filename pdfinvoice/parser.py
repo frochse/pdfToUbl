@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
+from . import kvk
 from . import patterns as P
 from .model import Invoice, LineItem, Party
 from .numbers import (
@@ -125,10 +126,17 @@ def _find_labelled_value(lines: List[str], labels: List[str]) -> Optional[str]:
 
 
 def _strip_trailing_label(value: str) -> str:
-    """Cut a value short when the next column's label follows it on one line."""
+    """Cut a value short when the next column's label follows it on one line.
+
+    Two-column headers set "Factuurnummer : 26001434    Kenteken : 1-XHK-91" as
+    one line, and the wide gap between the columns does not always survive text
+    extraction — so any label that follows, whatever it is called, ends the
+    value as surely as a run of spaces does.
+    """
     cut = re.split(
         r"\s{3,}|\s+(?=(?:invoice|factuur|date|datum|due|verval|customer|klant|"
-        r"order|page|pagina)\b)",
+        r"order|page|pagina)\b)|"
+        r"\s+(?=[A-Za-z][\w.]*(?:\s+[\w.]+){0,3}\s+:)",
         value,
         maxsplit=1,
         flags=re.IGNORECASE,
@@ -214,13 +222,7 @@ def _parse_parties(inv: Invoice, doc: Document) -> None:
     text = doc.text
     lines = doc.lines
 
-    ibans = [
-        m.replace(" ", "").upper()
-        for m in P.IBAN_RE.findall(text)
-        if _looks_like_iban(m)
-    ]
-    if ibans:
-        inv.supplier.iban = ibans[0]
+    inv.supplier.iban = _find_iban(text)
 
     _assign_vat_numbers(inv, lines, _find_vat_ids(text))
 
@@ -240,20 +242,64 @@ def _parse_parties(inv: Invoice, doc: Document) -> None:
     # the flattened text runs the two together ("1016 ED Amsterdam Terms Due on
     # receipt"). Word positions keep them apart; fall back to the plain text
     # when a PDF carries no usable geometry.
-    inv.supplier.name, inv.supplier.address = _supplier_block_from_columns(doc)
-    if not inv.supplier.name:
-        inv.supplier.name, inv.supplier.address = _guess_supplier_block(
+    supplier_name, supplier_address = _supplier_block_from_columns(doc)
+    if not supplier_name and not supplier_address:
+        supplier_name, supplier_address = _guess_supplier_block(
             doc.pages[0] if doc.pages else ""
         )
+    supplier_name = _registered_or_printed_name(inv, supplier_name)
+    if not supplier_name and inv.supplier.coc_number:
+        # Printed stationery carries the company name as a logo, which OCR
+        # returns as nothing at all. Nothing left on the page is the name —
+        # the web address only resembles it — so the field stays empty and
+        # says which number to write down to fill it.
+        inv.warnings.append(
+            f"no supplier name on the invoice; add KvK "
+            f"{inv.supplier.coc_number} to the name file to fill it in"
+        )
+    inv.supplier.name, inv.supplier.address = supplier_name, supplier_address
+
     # "Date  Billed to" and "Bill To  Ship To" both put the customer in a
     # column that the flattened text runs together with its neighbour, so the
     # geometry is tried first and the plain text is the fallback.
     name, address, coc = _customer_block_from_columns(doc)
     if not name:
         name, address = _guess_customer_block(lines)
+    if not name:
+        name, address = _addressee_block_from_columns(
+            doc, {supplier_name, *supplier_address}
+        )
     inv.customer.name, inv.customer.address = name, address
     if coc and not inv.customer.coc_number:
         inv.customer.coc_number = coc
+
+
+def _registered_or_printed_name(inv: Invoice, printed: Optional[str]) -> Optional[str]:
+    """The Handelsregister's name for the supplier, or what the page printed.
+
+    The register is leading. An invoice prints the trade name the garage goes
+    by ("Roos"), the register holds the one the creditor is booked under
+    ("Garagebedrijf Roos B.V."), and only the second is stable across invoices
+    — so where the KvK number resolves, the printed name gives way and the
+    substitution is reported rather than made quietly.
+    """
+    registered = kvk.registered_name(inv.supplier.coc_number)
+    if not registered:
+        return printed
+    if printed and _same_company(printed, registered):
+        return registered
+    if printed:
+        inv.warnings.append(
+            f"supplier name {printed!r} replaced by the registered name "
+            f"{registered!r} (KvK {inv.supplier.coc_number})"
+        )
+    return registered
+
+
+def _same_company(one: str, other: str) -> bool:
+    """Whether two spellings differ only in punctuation: "BV" and "B.V."."""
+    strip = lambda name: re.sub(r"[^a-z0-9]", "", name.lower())  # noqa: E731
+    return strip(one) == strip(other)
 
 
 # Words further apart than this are in different columns, not the same phrase.
@@ -281,16 +327,59 @@ def _looks_like_labelled_field(text: str) -> bool:
     )
 
 
+# Letterheads set several fields on one line, divided by a bar or a bullet:
+# "Omroepweg 15, 1324 KT Almere | Tel. 036 534 65 50".
+_PIECE_SEPARATOR = re.compile(r"\s*[|•·]\s*|\s{3,}")
+# A piece that is a way to reach or register the company, not its address.
+_CONTACT_PIECE = re.compile(
+    r"\b(tel|telefoon|phone|fax|mob(?:iel)?|gsm|iban|bic|swift|rekening|"
+    r"k\.?v\.?k\.?|handelsregister|btw|vat|ust)\b",
+    re.IGNORECASE,
+)
+
+
+def _letterhead_pieces(text: str) -> List[str]:
+    """The parts of a letterhead line that say who the company is and where.
+
+    Phone, bank and registration numbers are dropped: each already has a field
+    of its own, and leaving them in the address puts them in the UBL street.
+    """
+    pieces = []
+    for piece in _PIECE_SEPARATOR.split(text):
+        piece = piece.strip(" ,;")
+        if not piece or _CONTACT_PIECE.search(piece):
+            continue
+        if P.EMAIL_RE.search(piece) or _URL_LINE.search(piece):
+            continue
+        if _find_vat_ids(piece):
+            continue
+        pieces.append(piece)
+    return pieces
+
+
+# A postcode with its town: "1324 KT Almere", "10115 Berlin".
+_POSTCODE_PIECE = re.compile(r"^\d{4,6}\s?[A-Z]{0,2}\s+\w", re.IGNORECASE)
+
+
+def _is_address_piece(text: str) -> bool:
+    return bool(_STREET_START.search(text) or _POSTCODE_PIECE.match(text))
+
+
 def _supplier_block_from_columns(doc: Document) -> Tuple[Optional[str], List[str]]:
     """Letterhead name and address, read from the column they stand in.
 
     The letterhead is not always at the left margin — plenty of invoices set it
     flush right — so the column is found from the first letterhead-looking run
     of words on page one, and the rest of the block is whatever sits under it.
+
+    The name can be missing altogether: printed stationery often carries it as
+    a logo, and OCR reads the address around it but not the drawing. An address
+    with no name is still the supplier's, and reporting it as such is what
+    keeps the addressee from being taken for the company.
     """
     rows = doc.word_rows[0] if doc.word_rows else []
 
-    start, name, span = None, None, None
+    start, header, span = None, None, None
     for index, row in enumerate(rows[:20]):
         for x0, x1, text in _segments(row):
             if _HEADER_NOISE.match(text) or not _is_letterhead_line(text):
@@ -301,14 +390,18 @@ def _supplier_block_from_columns(doc: Document) -> Tuple[Optional[str], List[str
                 continue
             if _looks_like_labelled_field(text) or _is_item_column_word(text):
                 continue
-            start, name, span = index, text, (x0, x1)
+            start, header, span = index, text, (x0, x1)
             break
-        if name:
+        if header:
             break
-    if name is None:
+    if header is None:
         return None, []
 
-    address: List[str] = []
+    pieces = _letterhead_pieces(header)
+    named = [piece for piece in pieces if not _is_address_piece(piece)]
+    name = named[0] if named else None
+    address: List[str] = [piece for piece in pieces if _is_address_piece(piece)]
+
     for row in rows[start + 1 : start + 10]:
         text = _overlapping_segment(row, span)
         if text is None:
@@ -327,8 +420,9 @@ def _supplier_block_from_columns(doc: Document) -> Tuple[Optional[str], List[str
             break
         if _is_prose_line(text) or _URL_LINE.search(text):
             continue
-        address.append(text)
-        if len(address) == 4:
+        address.extend(_letterhead_pieces(text))
+        if len(address) >= 4:
+            del address[4:]
             break
     return name, address
 
@@ -489,6 +583,59 @@ def _customer_block_from_columns(
     return None, [], None
 
 
+def _addressee_block_from_columns(
+    doc: Document, supplier_lines: set
+) -> Tuple[Optional[str], List[str]]:
+    """The block the invoice is addressed to, when nothing labels it as such.
+
+    A Dutch invoice usually prints no "Factuuradres" at all: the customer is
+    simply the block sitting in the window-envelope position, between the
+    letterhead and the labelled fields ("Factuurnummer : ..."). Those fields
+    are the anchor — the block ends where they begin — and the block is only
+    believed when it holds something that looks like an address, so a slogan
+    under a logo is not read as a customer.
+    """
+    rows = doc.word_rows[0] if doc.word_rows else []
+    fields = next(
+        (index for index, row in enumerate(rows) if _row_has_labelled_field(row)),
+        None,
+    )
+    if not fields:  # no fields at all, or nothing above them
+        return None, []
+
+    segments = _segments(rows[fields - 1])
+    if not segments:
+        return None, []
+    span = (segments[0][0], segments[0][1])
+
+    block: List[str] = []
+    for row in reversed(rows[:fields]):
+        text = _overlapping_segment(row, span)
+        if (
+            text is None
+            or text in supplier_lines
+            or _HEADER_NOISE.match(text)
+            or _IDENTIFIER_LINE.search(text)
+            or _find_vat_ids(text)
+            or P.EMAIL_RE.search(text)
+            or _URL_LINE.search(text)
+            or _looks_like_labelled_field(text)
+        ):
+            break
+        block.insert(0, text)
+        if len(block) == 5:
+            break
+
+    if not any(_is_address_piece(line) for line in block):
+        return None, []
+    name, address, _ = _split_name_from_address(block)
+    return name, address
+
+
+def _row_has_labelled_field(row: List[dict]) -> bool:
+    return any(_looks_like_labelled_field(text) for _, _, text in _segments(row))
+
+
 def _segments(row: List[dict]) -> List[Tuple[float, float, str]]:
     """Split a row into its columns, at the gaps between them."""
     words = sorted(row, key=lambda w: w["x0"])
@@ -578,6 +725,81 @@ def _looks_like_iban(candidate: str) -> bool:
         and compact[:2].isalpha()
         and compact[2:4].isdigit()
     )
+
+
+def _iban_checksum_ok(compact: str) -> bool:
+    """ISO 13616 mod-97: the check the two digits after the country exist for."""
+    if not (15 <= len(compact) <= 34) or not compact[:2].isalpha():
+        return False
+    rearranged = compact[4:] + compact[:4]
+    if not rearranged.isalnum():
+        return False
+    digits = "".join(str(int(char, 36)) for char in rearranged)
+    return int(digits) % 97 == 1
+
+
+# Glyphs tesseract swaps for digits. Only the ones it actually confuses: a
+# repair that may touch any character would find a passing checksum for
+# anything.
+_OCR_DIGIT_CONFUSIONS = {
+    "O": "0", "Q": "0", "D": "0",
+    "I": "1", "L": "1",
+    "Z": "2", "S": "5", "G": "6", "T": "7", "B": "8",
+}
+
+
+def _repair_ocr_iban(compact: str) -> Optional[str]:
+    """Undo OCR's letter-for-digit slips in an account number, or give up.
+
+    "NL50 INGB 0006 8780 69" comes back from a scanned letterhead as
+    "NLSO INGB ...". Which letters were digits is not knowable from the string,
+    so every combination is tried and the checksum decides — but a checksum is
+    1-in-97 to pass by luck, so a repair is only trusted when the fewest-edit
+    one is the only one that passes. Anything else is left unread: a plausible
+    but wrong bank account is worse on an invoice than none at all.
+    """
+    positions = [i for i, char in enumerate(compact)
+                 if char in _OCR_DIGIT_CONFUSIONS]
+    if not positions or len(positions) > 8:
+        return None
+
+    passing: Dict[int, List[str]] = {}
+    for mask in range(1, 1 << len(positions)):
+        chars = list(compact)
+        for bit, index in enumerate(positions):
+            if mask >> bit & 1:
+                chars[index] = _OCR_DIGIT_CONFUSIONS[compact[index]]
+        candidate = "".join(chars)
+        if _iban_checksum_ok(candidate):
+            passing.setdefault(bin(mask).count("1"), []).append(candidate)
+
+    if not passing:
+        return None
+    fewest = passing[min(passing)]
+    return fewest[0] if len(fewest) == 1 else None
+
+
+def _find_iban(text: str) -> Optional[str]:
+    """The supplier's account number, preferring one whose checksum holds."""
+    candidates = [
+        match.replace(" ", "").upper()
+        for match in P.IBAN_RE.findall(text)
+        if _looks_like_iban(match)
+    ]
+    for candidate in candidates:
+        if _iban_checksum_ok(candidate):
+            return candidate
+
+    for labelled in P.IBAN_LABEL_RE.findall(text):
+        compact = labelled.replace(" ", "").upper()
+        if _iban_checksum_ok(compact):
+            return compact
+        repaired = _repair_ocr_iban(compact)
+        if repaired:
+            return repaired
+
+    # Nothing validates: fall back to what is printed rather than drop it.
+    return candidates[0] if candidates else None
 
 
 # --- line items -------------------------------------------------------------
@@ -846,6 +1068,15 @@ def _split_trailing_amounts(
 # --- consistency ------------------------------------------------------------
 
 
+# VAT rates in use across the EU, standard and reduced. A rate derived from the
+# totals is only believed when it lands on one of these: on an invoice with more
+# than one rate the division yields a blend, and a blend almost never does.
+_KNOWN_TAX_RATES = (
+    0, 2.1, 2.5, 3, 4, 4.8, 5, 5.5, 6, 7, 7.7, 8, 8.1, 9, 10, 11, 12, 13, 13.5,
+    14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 25.5, 27,
+)
+
+
 def _reconcile(inv: Invoice) -> None:
     """Fill in derivable totals and warn about anything that does not add up."""
     net, tax, gross = inv.total_net, inv.total_tax, inv.total_gross
@@ -861,6 +1092,9 @@ def _reconcile(inv: Invoice) -> None:
         inv.total_gross = round(net + inv.total_tax, 2)
 
     net, tax, gross = inv.total_net, inv.total_tax, inv.total_gross
+    if inv.tax_rate is None:
+        inv.tax_rate = _rate_from_totals(net, tax)
+
     if None not in (net, tax, gross) and abs(net + tax - gross) > 0.02:
         inv.warnings.append(
             f"totals do not add up: net {net} + tax {tax} != gross {gross}"
@@ -877,3 +1111,21 @@ def _reconcile(inv: Invoice) -> None:
             inv.warnings.append(f"missing required field: {name}")
     if not inv.lines:
         inv.warnings.append("no invoice lines detected")
+
+
+def _rate_from_totals(
+    net: Optional[float], tax: Optional[float]
+) -> Optional[float]:
+    """The VAT rate the totals imply, when the invoice never prints it as "21%".
+
+    A VAT summary table sets the rate in a column of its own ("Btwcode % ..."
+    over "1 21,00 ..."), where the number carries no percent sign and cannot be
+    told from the amounts beside it. Without a rate the UBL tax category goes
+    out with no Percent, which NLCIUS requires for a standard-rated invoice.
+    """
+    if not net or tax is None or net <= 0:
+        return None
+    rate = min(_KNOWN_TAX_RATES, key=lambda known: abs(known - tax / net * 100))
+    if abs(round(net * rate / 100, 2) - tax) > 0.02:
+        return None
+    return float(rate)

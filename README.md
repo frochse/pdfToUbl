@@ -12,8 +12,14 @@ time.
 
 ```sh
 python3 -m venv .venv
+.venv/bin/pip install --upgrade pip    # the seeded pip may be too old to install this
 .venv/bin/pip install -e ".[dev]"      # drop [dev] if you don't need the tests
 ```
+
+The upgrade is not optional on a stock macOS `python3` (3.9), whose venv seeds
+pip 21.2.4 — too old for [PEP 660](https://peps.python.org/pep-0660/), so the
+editable install of a project with no `setup.py` fails with *"Directory cannot
+be installed in editable mode"*. Any pip 21.3 or newer is fine.
 
 Then use `.venv/bin/pdfinvoice`, or `python -m pdfinvoice` without installing.
 The browser UI needs Flask: it comes with `[dev]`, or install `".[web]"` on its
@@ -219,6 +225,48 @@ If a PDF has no text layer, install [`ocrmypdf`](https://ocrmypdf.readthedocs.io
 (`brew install ocrmypdf`) and it is used automatically. Without it you get a
 clear error rather than an empty result. OCR'd output is flagged with
 `ocr_used: true` — check the numbers.
+
+OCR also runs on a PDF that *does* have a text layer but hides part of the page
+in a picture — an invoice printed on scanned stationery, where the letterhead
+with the KvK, VAT and bank details is an image and only the fields the
+accounting package filled in are text. Such a page is read with `--redo-ocr`,
+which keeps the existing text exactly as it is and reads only the picture, so
+amounts that were already perfect are never put through OCR.
+
+Add the Dutch language pack (`brew install tesseract-lang`) — without it
+tesseract reads a Dutch letterhead in English and misreads more of it.
+
+A company name set as a logo stays unread whatever OCR does. The letterhead
+then yields an address and no name, and the name stays empty: the web address
+beside it resembles the name without being it — `garageroos.nl` belongs to
+Garagebedrijf Roos B.V. — and a plausible wrong creditor is worse than a blank
+one. The warning names the KvK number to write down; see below.
+
+## Registered company names
+
+The Handelsregister is leading on what a supplier is called: an invoice prints
+a trade name or a logo, and Exact books a creditor. Where the KvK number on the
+invoice appears in a name file, that name replaces the printed one, and the
+substitution is reported in `warnings`. Where it does not, and the invoice
+prints no name either, the field stays empty and `warnings` says which number
+to add:
+
+```
+no supplier name on the invoice; add KvK 77731964 to the name file to fill it in
+```
+
+There is no lookup over the network — this tool makes none — so the file is
+filled in by hand, which only pays off for suppliers that recur:
+
+```json
+{ "77731964": "Garagebedrijf Roos B.V." }
+```
+
+`pdfinvoice/kvk_names.json` ships with the tool. Your own additions go in
+`~/.config/pdfinvoice/kvk-names.json`, which is merged over it and wins, so
+they survive a reinstall; set `PDFINVOICE_KVK_NAMES` to keep the list
+somewhere else, such as beside the bookkeeping. A malformed file is ignored
+rather than fatal.
 
 ## Limits
 
