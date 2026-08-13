@@ -146,18 +146,28 @@ installed.
 | `--port N` | port (default `8000`) |
 | `--no-browser` | do not open a browser window on start |
 | `--debug` | enable the Flask reloader |
-| `--mail-to ADDRESS` | default recipient for the mail button |
+| `--mail-to ADDRESS` | recipient for this run only |
+| `--set-mail-to ADDRESS` | save the default recipient and exit |
+| `--show-config` | print the saved settings and exit |
 
 ### Mailing an invoice to Exact (macOS)
 
 Each invoice card has a **Mail PDF + UBL** button. It opens a draft in Apple
 Mail with both files attached, addressed to whatever is in the *Mailen naar*
-field. That field starts empty; `--mail-to` prefills it, which is where the
-purchase inbox of your accounting package goes:
+field. That field is prefilled with the purchase inbox of your accounting
+package, once you have said what it is:
 
 ```sh
-pdfinvoice-web --mail-to inkoop@example.exact.nl
+pdfinvoice-web --set-mail-to 12ab34cd@inkoop.exactonline.nl   # once
+pdfinvoice-web                                                # prefilled from now on
 ```
+
+The address is written to `~/.config/pdfinvoice/config.json` and never to the
+source. That is deliberate: a purchase inbox accepts whatever is sent to it, so
+an address committed to a repository is an open door into the administration
+behind it. `PDFINVOICE_CONFIG` moves the file; `PDFINVOICE_MAIL_TO` overrides
+it for one run and `--mail-to` for one command; `--set-mail-to ""` clears it.
+`--show-config` prints what is set.
 
 The draft is composed and shown, **never sent**: sending is the step that cannot
 be taken back, so it stays with whoever is at the keyboard.

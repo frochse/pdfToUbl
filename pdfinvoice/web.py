@@ -8,6 +8,8 @@ temporary directory that is deleted before the response is sent.
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import tempfile
 import threading
 import webbrowser
@@ -17,16 +19,29 @@ from typing import List
 from flask import Flask, jsonify, render_template, request
 from werkzeug.utils import secure_filename
 
-from . import mailer, ubl
+from . import config, mailer, ubl
 from .export import csv_string
 from .model import Invoice
 from .parser import parse
 from .textio import extract, ocr_available
 
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
-# The mail button's recipient. Empty by default so no address is baked into the
-# source; pass --mail-to to prefill the field, or type one in the page.
+# The mail button's recipient. Empty in the source on purpose: the purchase
+# inbox of an accounting package accepts whatever is sent to it, so the address
+# is a setting and never a literal in a repository. --set-mail-to writes it,
+# PDFINVOICE_MAIL_TO overrides it for one run, --mail-to for one command.
 DEFAULT_MAIL_TO = ""
+MAIL_TO_SETTING = "mail_to"
+MAIL_TO_ENV = "PDFINVOICE_MAIL_TO"
+# Enough of a check to catch a typed mistake; the mail client judges the rest.
+_ADDRESS = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def configured_mail_to() -> str:
+    """The recipient to start from: the environment, else the settings file."""
+    return (os.environ.get(MAIL_TO_ENV)
+            or config.get(MAIL_TO_SETTING)
+            or DEFAULT_MAIL_TO)
 
 
 def create_app(mail_to: str = DEFAULT_MAIL_TO) -> Flask:
@@ -186,19 +201,49 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--no-browser", action="store_true",
                     help="do not open a browser window on start")
     ap.add_argument("--debug", action="store_true", help="enable Flask reloader")
-    ap.add_argument("--mail-to", default=DEFAULT_MAIL_TO, metavar="ADDRESS",
-                    help="prefill the mail button's recipient, e.g. the "
-                         "purchase inbox of your accounting package")
+    ap.add_argument("--mail-to", default=None, metavar="ADDRESS",
+                    help="recipient for this run, e.g. the purchase inbox of "
+                         "your accounting package (default: the saved one)")
+    ap.add_argument("--set-mail-to", metavar="ADDRESS",
+                    help="save ADDRESS as the default recipient and exit; it "
+                         f"is written to {config.path()}, never to the source")
+    ap.add_argument("--show-config", action="store_true",
+                    help="print the saved settings and exit")
     args = ap.parse_args(argv)
 
+    if args.set_mail_to is not None:
+        return _save_mail_to(args.set_mail_to)
+    if args.show_config:
+        saved = config.get(MAIL_TO_SETTING) or "(none)"
+        print(f"settings file : {config.path()}")
+        print(f"mail_to       : {saved}")
+        if os.environ.get(MAIL_TO_ENV):
+            print(f"{MAIL_TO_ENV}: {os.environ[MAIL_TO_ENV]}  (overrides it)")
+        return 0
+
+    mail_to = args.mail_to if args.mail_to is not None else configured_mail_to()
     url = f"http://{'localhost' if args.host == '127.0.0.1' else args.host}:{args.port}/"
     print(f"pdfinvoice web UI on {url}  (ctrl-c to stop)")
+    if mail_to:
+        print(f"mail button addressed to {mail_to}")
     if not args.no_browser and not args.debug:
         threading.Timer(0.7, webbrowser.open, args=(url,)).start()
 
-    create_app(mail_to=args.mail_to).run(
+    create_app(mail_to=mail_to).run(
         host=args.host, port=args.port, debug=args.debug
     )
+    return 0
+
+
+def _save_mail_to(address: str) -> int:
+    """Write the default recipient, or refuse an address that cannot be one."""
+    address = address.strip()
+    if address and not _ADDRESS.match(address):
+        print(f"not an e-mail address: {address!r}")
+        return 2
+    written = config.set_value(MAIL_TO_SETTING, address)
+    print(f"default recipient {'cleared' if not address else address} "
+          f"in {written}")
     return 0
 
 
