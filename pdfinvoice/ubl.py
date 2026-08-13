@@ -293,7 +293,8 @@ def conformance_warnings(inv: Invoice, default_currency: str = "EUR") -> List[st
 
 def _party(root: ET.Element, wrapper: str, party: Party) -> None:
     if not any(
-        [party.name, party.address, party.vat_number, party.coc_number, party.email]
+        [party.name, party.address, party.vat_number, party.coc_number,
+         party.email, party.contact_name]
     ):
         return
 
@@ -314,8 +315,13 @@ def _party(root: ET.Element, wrapper: str, party: Party) -> None:
             _cbc(entity, "CompanyID", party.coc_number).set(
                 "schemeID", KVK_SCHEME_ID
             )
-    if party.email:
-        _cbc(_cac(node, "Contact"), "ElectronicMail", party.email)
+    # cac:Contact is a sequence: Name before ElectronicMail (UBL-Common-2.1).
+    if party.contact_name or party.email:
+        contact = _cac(node, "Contact")
+        if party.contact_name:
+            _cbc(contact, "Name", party.contact_name)
+        if party.email:
+            _cbc(contact, "ElectronicMail", party.email)
 
 
 def _postal_address(party_node: ET.Element, party: Party) -> None:

@@ -120,11 +120,16 @@ VAT_ID_RE = re.compile(
     r"PL\d{10}|PT\d{9}|RO\d{2,10}|SE\d{12}|SI\d{8}|SK\d{10}|GB\d{9}(?:\d{3})?)\b"
 )
 # "Registration number" is what a company register id is called on an invoice
-# printed in English; on a Dutch invoice that is the KvK number.
+# printed in English; on a Dutch invoice that is the KvK number, and a footer
+# often runs the two names together: "KVK-/ Ondernemingsnr. - 39037382". Hence
+# both spellings as labels of their own, and room between label and number for
+# the punctuation, the place name ("K.v.K. Amsterdam nr.") and the dashes that
+# a footer sets them in.
 COC_RE = re.compile(r"(?:\bk\.?v\.?k\.?|chamber\s*of\s*commerce|handelsregister|"
+                    r"ondernemings?\s*(?:nummer|nr\.?)|"
                     r"registration\s*(?:number|no\.?|nr\.?)|"
                     r"company\s*(?:registration|number))"
-                    r"[^\d\n]{0,15}(\d{6,10})", re.IGNORECASE)
+                    r"[^\d\n]{0,25}(\d{6,10})", re.IGNORECASE)
 EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 PAYMENT_REF_RE = re.compile(
     r"(?:payment\s*reference|betalingskenmerk|kenmerk|reference)\s*[:#]?\s*"

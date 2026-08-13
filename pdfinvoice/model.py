@@ -16,6 +16,9 @@ class Party:
     email: Optional[str] = None
     iban: Optional[str] = None
     bic: Optional[str] = None
+    # The person the invoice is addressed to, from a "T.a.v." line. Not the
+    # party: the invoice is billed to the company, care of this person.
+    contact_name: Optional[str] = None
 
 
 @dataclass

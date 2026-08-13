@@ -25,10 +25,23 @@ _TOTAL_WORDS = re.compile(
     r"te\s*betalen|balance|netto|gesamt|grondslag|summe)\b",
     re.IGNORECASE,
 )
+# The separator between a header and the name after it. The full stop is in
+# here for the abbreviations: "t.a.v." ends in one, and \b makes the label
+# match stop at the "v", so without this the name starts ". Frenk Ochse".
+_HEADER_SEPARATOR = r"\b[\s.:\-–]*"
+# "T.a.v. Frenk Ochse" names a person to hand the invoice to, inside a block
+# addressed to a company. Whoever is named here is the contact, and the line
+# above is the party — reading it the other way round bills a person for what
+# a company bought, and Exact then holds a debtor that does not exist.
+_ATTENTION_HEADERS = re.compile(
+    r"^\s*(ter\s*attentie\s*van|attention(?:\s*of)?|t\.?\s?a\.?\s?v\.?|attn?\.?|"
+    rf"c/o|care\s*of|z\.?\s?h\.?\s?a\.?){_HEADER_SEPARATOR}(.*)$",
+    re.IGNORECASE,
+)
 _CUSTOMER_HEADERS = re.compile(
     r"^\s*(bill(?:ed)?\s*to|invoice\s*to|sold\s*to|ship\s*to|customer|client|"
     r"factuuradres|factureren\s*aan|geadresseerde|t\.?a\.?v\.?|"
-    r"rechnungsempf(?:ä|ae)nger|kunde)\b\s*[:\-]?\s*(.*)$",
+    rf"rechnungsempf(?:ä|ae)nger|kunde){_HEADER_SEPARATOR}(.*)$",
     re.IGNORECASE,
 )
 # Who the invoice is addressed to. "Ship To" is not here on purpose: it is the
@@ -36,7 +49,7 @@ _CUSTOMER_HEADERS = re.compile(
 _BILLING_HEADERS = re.compile(
     r"^\s*(bill(?:ed)?\s*to|invoice\s*to|sold\s*to|"
     r"factuuradres|factureren\s*aan|geadresseerde|t\.?a\.?v\.?|"
-    r"rechnungsempf(?:ä|ae)nger)\b\s*[:\-]?\s*(.*)$",
+    rf"rechnungsempf(?:ä|ae)nger){_HEADER_SEPARATOR}(.*)$",
     re.IGNORECASE,
 )
 _HEADER_NOISE = re.compile(
@@ -170,8 +183,11 @@ _IDENTIFIER_LINE = re.compile(
 )
 
 
+_TOTAL_BUCKETS = ("total_net", "total_tax", "total_gross")
+
+
 def _parse_totals(inv: Invoice, lines: List[str]) -> None:
-    best: Dict[str, Tuple[Tuple[int, int], float]] = {}
+    found: Dict[str, List[Tuple[Tuple[int, int], float]]] = {}
 
     for line in lines:
         clean = strip_dates(line)
@@ -189,12 +205,60 @@ def _parse_totals(inv: Invoice, lines: List[str]) -> None:
         # A money-shaped value (with decimals) beats a bare integer, which is
         # more often a reference or a payment term sharing the line.
         rank = (priority, 1 if written_with_decimals(token) else 0)
-        current = best.get(bucket)
-        if current is None or rank > current[0]:
-            best[bucket] = (rank, value)
+        found.setdefault(bucket, []).append((rank, value))
 
-    for bucket, (_, value) in best.items():
+    for bucket, value in _choose_totals(found).items():
         setattr(inv, bucket, value)
+
+
+def _choose_totals(
+    found: Dict[str, List[Tuple[Tuple[int, int], float]]]
+) -> Dict[str, float]:
+    """Pick one amount per bucket out of everything that could be it.
+
+    An invoice can print the same wording several times: a fuel card bills per
+    vehicle, so "Totaal kenteken: ... 92,82" and "Totaal contract: ... 92,82"
+    stand above "TOTAAL EUR 112,31" and all three read as a grand total. The
+    invoice settles it itself — net plus VAT is the gross, and only one
+    combination of the candidates does that — so the triple that adds up wins.
+    Failing that the last one printed does, the grand total being what a
+    totals block builds towards.
+    """
+    ranked: Dict[str, List[float]] = {}
+    for bucket, candidates in found.items():
+        best = max(rank for rank, _ in candidates)
+        values = [value for rank, value in candidates if rank == best]
+        ranked[bucket] = list(dict.fromkeys(values))  # keep order, drop repeats
+
+    options = [ranked.get(bucket) or [None] for bucket in _TOTAL_BUCKETS]
+    chosen = [values[-1] for values in options]
+
+    if not _adds_up(*chosen):
+        for net in reversed(options[0]):
+            for tax in reversed(options[1]):
+                for gross in reversed(options[2]):
+                    if _adds_up(net, tax, gross):
+                        chosen = [net, tax, gross]
+                        break
+                else:
+                    continue
+                break
+            else:
+                continue
+            break
+
+    return {
+        bucket: value
+        for bucket, value in zip(_TOTAL_BUCKETS, chosen)
+        if value is not None
+    }
+
+
+def _adds_up(net: Optional[float], tax: Optional[float],
+             gross: Optional[float]) -> bool:
+    if None in (net, tax, gross):
+        return False
+    return abs(net + tax - gross) <= 0.02
 
 
 def _classify_total(line: str) -> Tuple[Optional[str], int]:
@@ -262,16 +326,32 @@ def _parse_parties(inv: Invoice, doc: Document) -> None:
     # "Date  Billed to" and "Bill To  Ship To" both put the customer in a
     # column that the flattened text runs together with its neighbour, so the
     # geometry is tried first and the plain text is the fallback.
-    name, address, coc = _customer_block_from_columns(doc)
+    name, address, coc, contact = _customer_block_from_columns(doc)
     if not name:
-        name, address = _guess_customer_block(lines)
+        name, address, contact = _guess_customer_block(lines)
     if not name:
         name, address = _addressee_block_from_columns(
             doc, {supplier_name, *supplier_address}
         )
-    inv.customer.name, inv.customer.address = name, address
+        address, contact = _pull_contact(address)
+    inv.customer.name, inv.customer.address = _clean_party_name(name), address
+    inv.customer.contact_name = contact
+    inv.supplier.name = _clean_party_name(inv.supplier.name)
     if coc and not inv.customer.coc_number:
         inv.customer.coc_number = coc
+
+
+def _clean_party_name(name: Optional[str]) -> Optional[str]:
+    """No company or person is called ". Frenk Ochse".
+
+    Whatever left punctuation in front of a name — an abbreviated header, a
+    bullet, a dash used as a separator — the name itself never opens with it,
+    and the leftover travels into the UBL and into the creditor in Exact.
+    """
+    if not name:
+        return name
+    cleaned = re.sub(r"^[\s.,:;\-–—•|]+", "", name).strip()
+    return cleaned or None
 
 
 def _registered_or_printed_name(inv: Invoice, printed: Optional[str]) -> Optional[str]:
@@ -451,6 +531,27 @@ def _find_vat_ids(text: str) -> List[str]:
 _CUSTOMER_VAT_LINE = re.compile(
     r"\b(customer|client|buyer|klant|debiteur|koper|kunde)\b", re.IGNORECASE
 )
+_VAT_WORDED = re.compile(r"\b(btw|vat|tax|mwst|ust)\b", re.IGNORECASE)
+
+
+def _customer_vat_numbers(lines: List[str]) -> List[str]:
+    """The VAT numbers an invoice marks as the buyer's.
+
+    "BTW nummer klant:" is a heading with nothing after it: the number stands
+    on the line below, beside the customer's name. So a label with no number on
+    it hands the search to the next line — but only a label that says VAT as
+    well as customer, or "Debiteurnummer 1487" would claim whatever number
+    happens to follow it.
+    """
+    found: List[str] = []
+    for index, line in enumerate(lines):
+        if not _CUSTOMER_VAT_LINE.search(line):
+            continue
+        on_line = _find_vat_ids(line)
+        if not on_line and _VAT_WORDED.search(line) and index + 1 < len(lines):
+            on_line = _find_vat_ids(lines[index + 1])
+        found.extend(on_line)
+    return found
 
 
 def _assign_vat_numbers(inv: Invoice, lines: List[str], vat_ids: List[str]) -> None:
@@ -460,12 +561,7 @@ def _assign_vat_numbers(inv: Invoice, lines: List[str], vat_ids: List[str]) -> N
     ("Customer VAT/TAX No: ...") would otherwise hand it to the supplier and
     send the document to the wrong account in Exact.
     """
-    customer_vats = [
-        vat
-        for line in lines
-        if _CUSTOMER_VAT_LINE.search(line)
-        for vat in _find_vat_ids(line)
-    ]
+    customer_vats = _customer_vat_numbers(lines)
     supplier_vats = [vat for vat in vat_ids if vat not in customer_vats]
 
     if supplier_vats:
@@ -523,14 +619,24 @@ def _is_letterhead_line(line: str) -> bool:
     return not (P.EMAIL_RE.search(line) or re.match(r"^[\d\s.,/-]+$", line))
 
 
-def _guess_customer_block(lines: List[str]) -> Tuple[Optional[str], List[str]]:
+def _guess_customer_block(
+    lines: List[str],
+) -> Tuple[Optional[str], List[str], Optional[str]]:
     for i, line in enumerate(lines):
         match = _CUSTOMER_HEADERS.match(line)
         if not match:
             continue
         block: List[str] = []
+        contact: Optional[str] = None
         inline = match.group(2).strip()
-        if inline:
+        above = lines[i - 1].strip() if i else ""
+        # An attention line stands under the company being billed, so the
+        # block starts on the line above it — unless there is nothing there,
+        # in which case the person named is who is being billed.
+        if _ATTENTION_HEADERS.match(line) and above and _is_addressee_line(above):
+            block.append(above)
+            contact = _clean_party_name(inline)
+        elif inline:
             block.append(inline)
         for follow in lines[i + 1 : i + 6]:
             follow = follow.strip()
@@ -544,29 +650,45 @@ def _guess_customer_block(lines: List[str]) -> Tuple[Optional[str], List[str]]:
             ):
                 break
             block.append(follow)
+
+        block, below = _pull_contact(block)
         if block:
-            return block[0], block[1:]
-    return None, []
+            return block[0], block[1:], contact or below
+    return None, [], None
 
 
 def _customer_block_from_columns(
     doc: Document,
-) -> Tuple[Optional[str], List[str], Optional[str]]:
+) -> Tuple[Optional[str], List[str], Optional[str], Optional[str]]:
     """Read the customer out of the column its header stands in.
 
     A two-column header flattens to "Date Billed to", and the row under it to
     "27 May 2026 Jan Jansen Voorbeeld BV ...", so neither line can be matched on
     its own. The x-position of the header word says where its column starts,
     and everything at or right of it on the rows below belongs to the customer.
+
+    An attention line is not that header. "T.a.v. Frenk Ochse" stands under the
+    company being billed, so the block starts one row higher and the person
+    becomes the contact.
     """
     for rows in doc.word_rows:
         for index, row in enumerate(rows):
             found = _customer_column_start(row)
             if found is None:
                 continue
-            span, inline = found
+            span, inline, attention = found
 
-            block: List[str] = [inline] if inline else []
+            block: List[str] = []
+            contact: Optional[str] = None
+            above = _overlapping_segment(rows[index - 1], span) if index else None
+            if attention and above and _is_addressee_line(above):
+                # A company, for the attention of a person.
+                block.append(above)
+                contact = _clean_party_name(inline)
+            elif inline:
+                # Nothing above it: the person named is who is being billed.
+                block.append(inline)
+
             for follow in rows[index + 1 : index + 6]:
                 text = _overlapping_segment(follow, span)
                 if (
@@ -575,12 +697,52 @@ def _customer_block_from_columns(
                     or _is_column_header_text(text)
                     or _is_item_column_word(text)
                     or _BILLING_HEADERS.match(text)
+                    # The block ends where the field table begins, even when
+                    # this column holds only its first heading ("Contractnr").
+                    or _row_has_labelled_field(follow)
                 ):
                     break
                 block.append(text)
+
+            block, below = _pull_contact(block)
             if block:
-                return _split_name_from_address(block)
-    return None, [], None
+                name, address, coc = _split_name_from_address(block)
+                return name, address, coc, contact or below
+    return None, [], None, None
+
+
+def _is_addressee_line(text: str) -> bool:
+    """Whether a line can be the company an invoice is addressed to."""
+    return not (
+        _HEADER_NOISE.match(text)
+        or _IDENTIFIER_LINE.search(text)
+        or _find_vat_ids(text)
+        or P.EMAIL_RE.search(text)
+        or _URL_LINE.search(text)
+        or _TOTAL_WORDS.search(text)
+        or _looks_like_labelled_field(text)
+        or _is_column_header_text(text)
+        or _is_item_column_word(text)
+    )
+
+
+def _pull_contact(block: List[str]) -> Tuple[List[str], Optional[str]]:
+    """Take the attention line out of an address block.
+
+    The person named there is not part of the address and not the party: an
+    invoice to "FROC Holding B.V. / T.a.v. Frenk Ochse" is billed to the
+    company, for the attention of the person.
+    """
+    kept: List[str] = []
+    contact: Optional[str] = None
+    for line in block:
+        match = _ATTENTION_HEADERS.match(line)
+        person = _clean_party_name(match.group(2)) if match else None
+        if person and contact is None:
+            contact = person
+            continue
+        kept.append(line)
+    return kept, contact
 
 
 def _addressee_block_from_columns(
@@ -671,8 +833,11 @@ def _overlapping_segment(
     return best if widest > 0 else None
 
 
-def _customer_column_start(row: List[dict]) -> Optional[Tuple[Tuple[float, float], str]]:
-    """Where the billing address column begins in this row, and any name on it.
+def _customer_column_start(
+    row: List[dict],
+) -> Optional[Tuple[Tuple[float, float], str, bool]]:
+    """Where the billing address column begins in this row, what is on it, and
+    whether that is an attention line rather than the addressee itself.
 
     "Ship To" is deliberately not a billing header: an invoice that carries
     both prints them side by side, and the delivery address is not who gets
@@ -686,7 +851,7 @@ def _customer_column_start(row: List[dict]) -> Optional[Tuple[Tuple[float, float
         # "Customer # : 199678" is a reference field, not an address block.
         if inline and re.match(r"^[#:\d]", inline):
             continue
-        return (x0, x1), inline
+        return (x0, x1), inline, bool(_ATTENTION_HEADERS.match(text))
     return None
 
 

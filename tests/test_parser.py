@@ -2,7 +2,9 @@ from datetime import date
 
 import pdfinvoice
 from pdfinvoice.model import Invoice
-from pdfinvoice.parser import (_assign_vat_numbers, _find_iban, _find_vat_ids,
+from pdfinvoice.parser import (_assign_vat_numbers, _clean_party_name,
+                               _customer_vat_numbers,
+                               _find_iban, _find_vat_ids,
                                _guess_supplier_block, _items_from_text,
                                _letterhead_pieces, _looks_like_labelled_field,
                                _overlapping_segment, _segments,
@@ -167,6 +169,109 @@ def test_a_blended_rate_is_not_mistaken_for_a_real_one():
         "Te betalen € 1.155,00\n"
     ))
     assert inv.tax_rate is None
+
+
+def test_the_grand_total_wins_from_the_subtotals_printed_above_it():
+    """A fuel card bills per vehicle, so several lines say "Totaal" before the
+    one that means it. Net plus VAT settles which is which."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurnr : N06683352\n"
+        "Factuurdatum : 31-07-2026\n"
+        "Totaal kenteken: 1XHK91 92,82\n"
+        "Totaal contract: 5000156089 92,82\n"
+        "Subtotaal EUR 92,82\n"
+        "BTW 21,00% over 92,82 EUR 19,49\n"
+        "TOTAAL EUR 112,31\n"
+    ))
+    assert (inv.total_net, inv.total_tax, inv.total_gross) == (92.82, 19.49, 112.31)
+    assert not any("do not add up" in w for w in inv.warnings)
+
+
+def test_a_customer_vat_heading_claims_the_number_on_the_line_below():
+    """"BTW nummer klant:" is a heading with nothing after it; the number
+    stands below it, beside the customer's name. Read as the supplier's, it
+    swaps the two parties and books the invoice to the wrong account."""
+    inv = Invoice()
+    lines = [
+        "BTW nummer klant:",
+        "FROC Holding B.V. NL812913309B01",
+        "BTW nr - NL004010462B01 KVK-/ Ondernemingsnr. - 39037382",
+    ]
+    _assign_vat_numbers(inv, lines, _find_vat_ids("\n".join(lines)))
+
+    assert inv.supplier.vat_number == "NL004010462B01"
+    assert inv.customer.vat_number == "NL812913309B01"
+
+
+def test_a_footer_that_runs_two_register_names_together_still_yields_the_kvk():
+    """"KVK-/ Ondernemingsnr. - 39037382": 21 characters of label and dashes
+    stand between the word and the number."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurdatum : 31-07-2026\n"
+        "BTW nr - NL004010462B01 KVK-/ Ondernemingsnr. - 39037382 "
+        "IBAN - NL96ABNA0401863042\n"
+    ))
+    assert inv.supplier.coc_number == "39037382"
+
+
+def test_a_register_number_behind_a_place_name_is_still_found():
+    inv = pdfinvoice.parse(_doc("K.v.K. Amsterdam nr. 60895344\n"))
+
+    assert inv.supplier.coc_number == "60895344"
+
+
+def test_an_abbreviated_header_does_not_leave_its_full_stop_on_the_name():
+    """"T.a.v. Frenk Ochse" — the label match stops at the "v", and the dot
+    that follows used to become the first character of the name."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurdatum : 31-07-2026\n"
+        "T.a.v. Frenk Ochse\n"
+        "Land in Zicht 9\n"
+        "1316VJ ALMERE\n"
+    ))
+    assert inv.customer.name == "Frenk Ochse"
+
+
+def test_the_company_above_a_ter_attentie_van_line_is_the_customer():
+    """The invoice is billed to the company; the person is who to hand it to.
+    Read the other way round, Exact holds a debtor that does not exist."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurdatum : 31-07-2026\n"
+        "FROC Holding B.V.\n"
+        "T.a.v. Frenk Ochse\n"
+        "Land in Zicht 9\n"
+        "1316VJ ALMERE\n"
+    ))
+    assert inv.customer.name == "FROC Holding B.V."
+    assert inv.customer.contact_name == "Frenk Ochse"
+    assert inv.customer.address == ["Land in Zicht 9", "1316VJ ALMERE"]
+
+
+def test_a_person_billed_directly_stays_the_customer():
+    """No company above the attention line: the person is the party, and
+    naming them as their own contact would be nonsense."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurdatum : 31-07-2026\n"
+        "T.a.v. Frenk Ochse\n"
+        "Land in Zicht 9\n"
+    ))
+    assert inv.customer.name == "Frenk Ochse"
+    assert inv.customer.contact_name is None
+
+
+def test_no_party_name_opens_with_punctuation():
+    assert _clean_party_name(". Frenk Ochse") == "Frenk Ochse"
+    assert _clean_party_name("- Voorbeeld BV") == "Voorbeeld BV"
+    assert _clean_party_name("Voorbeeld B.V.") == "Voorbeeld B.V."
+    assert _clean_party_name(".") is None
+    assert _clean_party_name(None) is None
+
+
+def test_a_customer_label_without_the_word_vat_claims_nothing():
+    """"Debiteurnummer 1487" would otherwise take whatever number follows it."""
+    assert _customer_vat_numbers(
+        ["Debiteurnummer 1487", "BTW nr NL004010462B01"]
+    ) == []
 
 
 def test_vat_number_is_found_next_to_a_worded_label():

@@ -189,6 +189,7 @@ def render_text(inv: Invoice) -> str:
         ("Supplier VAT", inv.supplier.vat_number),
         ("Supplier IBAN", inv.supplier.iban),
         ("Customer", inv.customer.name),
+        ("Attention of", inv.customer.contact_name),
         ("Currency", inv.currency),
         ("Net total", _money(inv.total_net, cur)),
         ("VAT", _money(inv.total_tax, cur)),

@@ -253,6 +253,7 @@ function summaryPanel(inv, entry) {
     ["KvK-nummer leverancier", inv.supplier.coc_number],
     ["IBAN leverancier", inv.supplier.iban],
     ["Klant", inv.customer.name],
+    ["T.a.v.", inv.customer.contact_name],
     ["Btw-nummer klant", inv.customer.vat_number],
     ["Bedrag excl. btw", money(inv.total_net, inv.currency)],
     ["Btw-bedrag", money(inv.total_tax, inv.currency)],
