@@ -30,12 +30,17 @@ _CURRENCY_CODES = {
 }
 
 
-def parse_amount(text: str) -> float | None:
+def parse_amount(text: str, decimal_comma: bool = False) -> float | None:
     """Turn a raw amount string into a float, guessing the decimal separator.
 
     Handles both European (1.234,56) and Anglo (1,234.56) conventions by
     treating the *last* separator as decimal when it is followed by one or two
     digits, and as a thousands separator otherwise.
+
+    Three digits after a comma are the one shape that guess cannot settle:
+    "1,938" is 1938 to an Anglo reader and 1.938 to a Dutch one, and a fuel
+    price per litre is written exactly like that. `decimal_comma` says to read
+    it the Dutch way; the caller has to know something the token does not say.
     """
     if text is None:
         return None
@@ -62,7 +67,15 @@ def parse_amount(text: str) -> float | None:
         decimals = ""
     else:
         tail = s[sep_pos + 1 :]
-        if len(tail) in (1, 2) and tail.isdigit():
+        three_after_a_lone_comma = (
+            decimal_comma
+            and s[sep_pos] == ","
+            and len(tail) == 3
+            and tail.isdigit()
+            and s.count(",") == 1
+            and "." not in s
+        )
+        if (len(tail) in (1, 2) and tail.isdigit()) or three_after_a_lone_comma:
             digits = s[:sep_pos]
             decimals = tail
         else:  # separator groups thousands, e.g. "1.234" or "12,000"

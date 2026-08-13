@@ -73,3 +73,14 @@ def test_detect_currency():
     assert detect_currency("Bedragen in EUR") == "EUR"
     assert detect_currency("Total: £8,640.00") == "GBP"
     assert detect_currency("nothing here") is None
+
+
+def test_three_digits_after_a_comma_are_thousands_unless_told_otherwise():
+    """"1,938" is 1938 to an Anglo reader and 1.938 to a Dutch one; nothing in
+    the token settles it."""
+    assert parse_amount("1,938") == 1938.0
+    assert parse_amount("1,938", decimal_comma=True) == 1.938
+    # Everything else reads the same either way.
+    assert parse_amount("1.234,56", decimal_comma=True) == 1234.56
+    assert parse_amount("47,90", decimal_comma=True) == 47.90
+    assert parse_amount("1,234,567", decimal_comma=True) == 1234567.0

@@ -171,6 +171,121 @@ def test_a_blended_rate_is_not_mistaken_for_a_real_one():
     assert inv.tax_rate is None
 
 
+def _positioned_doc(rows) -> Document:
+    """A Document from rows of (text, x0, x1) words, with their positions."""
+    from pathlib import Path
+
+    word_rows = [
+        [{"text": text, "x0": x0, "x1": x1, "top": 14.0 * index,
+          "bottom": 14.0 * index + 9} for text, x0, x1 in row]
+        for index, row in enumerate(rows)
+    ]
+    pages = ["\n".join(" ".join(text for text, _, _ in row) for row in rows)]
+    return Document(path=Path("columns.pdf"), pages=pages, word_rows=[word_rows])
+
+
+# The field table of a fuel card invoice: six headings, and a row of values
+# under them that is one short — nothing was filled in for Debiteurnummer.
+_FIELD_TABLE = [
+    [("Contractnr", 25.5, 76.6), ("Debiteurnummer", 120.5, 200.4),
+     ("Factuurdatum", 235.3, 301.9), ("Vervaldatum", 327.0, 386.9),
+     ("Bladnr", 438.9, 470.5), ("Factuurnr", 510.4, 557.0)],
+    [("5000156089", 25.5, 75.6), ("31-07-2026", 255.9, 301.9),
+     ("07-08-2026", 340.6, 386.7), ("1", 453.1, 458.1), ("/", 460.5, 463.0),
+     ("1", 465.5, 470.5), ("N06683352", 510.4, 556.9)],
+]
+
+
+def test_a_label_used_as_a_column_heading_takes_the_value_below_it():
+    """The columns are right-aligned — "Factuurnr" ends at 557.0 and
+    "N06683352" at 556.9 — so the value is matched on overlap, not on where
+    it starts."""
+    inv = pdfinvoice.parse(_positioned_doc(_FIELD_TABLE))
+
+    assert inv.invoice_number == "N06683352"
+    assert inv.invoice_date == date(2026, 7, 31)
+    assert inv.due_date == date(2026, 8, 7)
+
+
+def test_a_heading_with_nothing_under_it_stays_empty():
+    """Debiteurnummer heads an empty column; the contract number beside it
+    belongs to Contractnr and must not slide over."""
+    inv = pdfinvoice.parse(_positioned_doc(_FIELD_TABLE))
+
+    assert inv.customer_number is None
+
+
+def test_a_row_of_label_and_value_pairs_is_not_a_row_of_headings():
+    """"Factuurnummer : 26001434" over "Factuurdatum : 22-07-2026" — the line
+    below is the next field, not this one's value."""
+    inv = pdfinvoice.parse(_positioned_doc([
+        [("Factuurnummer", 25, 100), (":", 104, 107), ("26001434", 112, 160)],
+        [("Factuurdatum", 25, 100), (":", 104, 107), ("22-07-2026", 112, 170)],
+    ]))
+
+    assert inv.invoice_number == "26001434"
+    assert inv.invoice_date == date(2026, 7, 22)
+
+
+def test_one_datum_column_does_not_make_an_item_table_a_field_table():
+    """An item table heads a column "Datum" and the row below opens with a
+    date. Two headings are needed before a row is read as fields."""
+    inv = pdfinvoice.parse(_positioned_doc([
+        [("Acceptatiepunt", 26, 85), ("Stand", 158, 190), ("Datum", 207, 240),
+         ("Product", 300, 345)],
+        [("De Haan Almere", 26, 85), ("47,90", 158, 190),
+         ("28-07-26", 207, 240), ("Euro 95", 300, 345)],
+        [("Factuurdatum", 25, 100), (":", 104, 107), ("31-07-2026", 112, 170)],
+    ]))
+
+    assert inv.invoice_date == date(2026, 7, 31)
+
+
+# The item table of a fuel card invoice. Its heading runs over two lines —
+# "Eenh" above "Prijs" is one word, eenheidsprijs — and the quantity column
+# stands in front of the product, not behind it.
+_FUEL_TABLE = [
+    [("V", 158.4, 164.4), ("Km", 167.2, 180.7), ("Eenh", 394.3, 415.3),
+     ("Bedrag", 505.3, 536.3), ("EUR", 538.8, 557.8)],
+    [("Acceptatiepunt", 25.5, 85.0), ("A", 158.4, 164.4), ("Stand", 167.2, 190.7),
+     ("Datum", 206.8, 233.3), ("Eenheden", 249.2, 290.2),
+     ("Product", 316.6, 347.5), ("Prijs", 394.3, 411.8), ("BTW", 436.9, 456.8),
+     ("%", 461.1, 469.1), ("excl.", 516.2, 536.2), ("BTW", 538.7, 559.2)],
+    [("De", 25.5, 35.7), ("Haan", 38.0, 57.1), ("Almere", 59.3, 84.6),
+     ("J", 157.2, 161.2), ("28-07-26", 206.8, 238.8), ("47,90", 249.2, 269.2),
+     ("Ltr", 290.6, 300.0), ("Euro", 316.6, 333.4), ("95", 335.7, 344.6),
+     ("1,938", 394.3, 414.3), ("21,00", 449.1, 469.1), ("92,82", 539.2, 559.2)],
+]
+
+
+def test_a_quantity_column_in_front_of_the_product_is_read_as_the_quantity():
+    """47,90 litres at 1,938 makes 92,82. Counted off from the right, the
+    price becomes the quantity and the VAT rate becomes the price."""
+    line = pdfinvoice.parse(_positioned_doc(_FUEL_TABLE)).lines[0]
+
+    assert line.description == "Euro 95"
+    assert line.quantity == 47.90
+    assert line.unit_price == 1.938
+    assert line.tax_rate == 21.0
+    assert line.amount == 92.82
+
+
+def test_a_heading_split_over_two_lines_is_read_as_one():
+    """"Bedrag EUR" over "excl. BTW" heads the amount column; without the line
+    above, the table has no amount column and is not read at all."""
+    from pdfinvoice.parser import _match_column_header
+
+    columns = _match_column_header(
+        [{"text": t, "x0": a, "x1": b} for t, a, b in _FUEL_TABLE[1]],
+        [{"text": t, "x0": a, "x1": b} for t, a, b in _FUEL_TABLE[0]],
+    )
+
+    assert columns is not None and "amount" in columns
+    # "Eenh" over the price column is the other half of "eenheidsprijs", not a
+    # second quantity heading: the lower line names the fields.
+    assert columns["quantity"][0] < columns["description"][0]
+
+
 def test_the_grand_total_wins_from_the_subtotals_printed_above_it():
     """A fuel card bills per vehicle, so several lines say "Totaal" before the
     one that means it. Net plus VAT settles which is which."""

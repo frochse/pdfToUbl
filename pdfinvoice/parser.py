@@ -60,7 +60,8 @@ _HEADER_NOISE = re.compile(
 
 # Column headers of the item table, per field.
 COLUMN_HINTS = {
-    "quantity": r"^(qty|quantity|aantal|menge|anz\.?|uren|hours|units?)$",
+    "quantity": r"^(qty|quantity|aantal|eenheden|menge|anz\.?|uren|hours|"
+                r"units?)$",
     "unit_price": r"^(unit|price|prijs|stukprijs|tarief|rate|preis|"
                   r"unitprice|per)$",
     "tax_rate": r"^(vat|btw|tax|mwst|vat%|btw%)$",
@@ -76,7 +77,7 @@ def parse(doc: Document, day_first: bool = True) -> Invoice:
     lines = doc.lines
 
     inv.currency = detect_currency(doc.text)
-    _parse_scalars(inv, lines, day_first)
+    _parse_scalars(inv, doc, day_first)
     _parse_totals(inv, lines)
     _parse_tax_rate(inv, doc.text)
     _parse_parties(inv, doc)
@@ -88,19 +89,16 @@ def parse(doc: Document, day_first: bool = True) -> Invoice:
 # --- labelled scalar fields -------------------------------------------------
 
 
-def _parse_scalars(inv: Invoice, lines: List[str], day_first: bool) -> None:
+def _parse_scalars(inv: Invoice, doc: Document, day_first: bool) -> None:
+    lines = doc.lines
     for field_name, labels in P.LABELS.items():
         value = _find_labelled_value(lines, labels)
-        if value is None:
-            continue
-        if field_name.endswith("_date"):
-            parsed = parse_date(value, day_first=day_first)
-            if parsed:
-                setattr(inv, field_name, parsed)
-        else:
-            cleaned = _clean_identifier(value)
-            if cleaned:
-                setattr(inv, field_name, cleaned)
+        if value is not None:
+            _set_scalar(inv, field_name, value, day_first)
+
+    # Only then the headings: a label printed in front of its value is the
+    # plainer statement, and this fills in what it did not cover.
+    _fields_under_column_headings(inv, doc, day_first)
 
     if inv.invoice_date is None:
         # Last resort: the first date-looking string anywhere in the document.
@@ -118,11 +116,82 @@ def _parse_scalars(inv: Invoice, lines: List[str], day_first: bool) -> None:
         inv.payment_reference = _clean_identifier(match.group(1))
 
 
+def _set_scalar(inv: Invoice, field: str, value: str, day_first: bool) -> None:
+    if field.endswith("_date"):
+        parsed = parse_date(value, day_first=day_first)
+        if parsed:
+            setattr(inv, field, parsed)
+        return
+    cleaned = _clean_identifier(value)
+    if cleaned:
+        setattr(inv, field, cleaned)
+
+
+# Words in a heading row are grouped into cells at a far smaller gap than
+# columns are, so "Invoice date" stays one heading while "Debiteurnummer
+# Factuurdatum" falls apart into two.
+_CELL_GAP = 8.0
+
+
+def _fields_under_column_headings(
+    inv: Invoice, doc: Document, day_first: bool
+) -> None:
+    """Fields whose label is a column heading, with the value on the row below.
+
+        Contractnr  Debiteurnummer  Factuurdatum  Vervaldatum  Bladnr  Factuurnr
+        5000156089                    31-07-2026    07-08-2026   1 / 1  N06683352
+
+    A heading is only read as one when the cell holds the label and nothing
+    else, and when at least two on the row do — otherwise "Factuurnummer :
+    26001434" above "Factuurdatum : 22-07-2026" would take the line below as
+    its value, and every item table with a "Datum" column would be a header.
+    """
+    for rows in doc.word_rows:
+        for index in range(len(rows) - 1):
+            headings = _labelled_columns(rows[index])
+            if len(headings) < 2:
+                continue
+            for field, span in headings.items():
+                if getattr(inv, field) is not None:
+                    continue
+                # Columns like these are right-aligned as often as left, so the
+                # value is the cell below that overlaps the heading, not the
+                # one that starts where it starts.
+                value = _overlapping_segment(rows[index + 1], span, _CELL_GAP)
+                if value:
+                    _set_scalar(inv, field, value, day_first)
+
+
+def _labelled_columns(row: List[dict]) -> Dict[str, Tuple[float, float]]:
+    """The fields this row names, and the column each one heads."""
+    columns: Dict[str, Tuple[float, float]] = {}
+    for x0, x1, text in _segments(row, _CELL_GAP):
+        field = _field_named_by(text)
+        if field and field not in columns:
+            columns[field] = (x0, x1)
+    return columns
+
+
+def _field_named_by(text: str) -> Optional[str]:
+    """The field a heading names, when the heading is nothing but the label."""
+    candidate = text.strip().strip(":#").strip()
+    if not candidate:
+        return None
+    for field, labels in P.LABELS.items():
+        if any(re.fullmatch(label, candidate, re.IGNORECASE) for label in labels):
+            return field
+    return None
+
+
 def _find_labelled_value(lines: List[str], labels: List[str]) -> Optional[str]:
     """Return the text following the first matching label.
 
     Falls back to the next line when the label sits alone on its own line,
-    which is what two-column invoice headers usually look like.
+    which is what two-column invoice headers usually look like — and only
+    then. A label at the end of a row of other labels heads a column, and the
+    line below it is a row of values, of which only one is this field's. That
+    case belongs to `_fields_under_column_headings`, which has the positions
+    to tell the values apart.
     """
     for label in labels:
         regex = P.label_value_re(label)
@@ -133,6 +202,8 @@ def _find_labelled_value(lines: List[str], labels: List[str]) -> Optional[str]:
             value = _strip_trailing_label(match.group(1).strip(" :#\t"))
             if value:
                 return value
+            if line[: match.start()].strip():
+                continue  # not alone on its line: a column heading
             if i + 1 < len(lines):
                 return lines[i + 1].strip()
     return None
@@ -798,14 +869,16 @@ def _row_has_labelled_field(row: List[dict]) -> bool:
     return any(_looks_like_labelled_field(text) for _, _, text in _segments(row))
 
 
-def _segments(row: List[dict]) -> List[Tuple[float, float, str]]:
+def _segments(
+    row: List[dict], gap: float = _COLUMN_GAP
+) -> List[Tuple[float, float, str]]:
     """Split a row into its columns, at the gaps between them."""
     words = sorted(row, key=lambda w: w["x0"])
     if not words:
         return []
     groups, current = [], [words[0]]
     for word in words[1:]:
-        if word["x0"] - current[-1]["x1"] > _COLUMN_GAP:
+        if word["x0"] - current[-1]["x1"] > gap:
             groups.append(current)
             current = [word]
         else:
@@ -817,7 +890,7 @@ def _segments(row: List[dict]) -> List[Tuple[float, float, str]]:
 
 
 def _overlapping_segment(
-    row: List[dict], span: Tuple[float, float]
+    row: List[dict], span: Tuple[float, float], gap: float = _COLUMN_GAP
 ) -> Optional[str]:
     """The column of this row that sits under `span`.
 
@@ -826,7 +899,7 @@ def _overlapping_segment(
     """
     low, high = span
     best, widest = None, 0.0
-    for x0, x1, text in _segments(row):
+    for x0, x1, text in _segments(row, gap):
         overlap = min(high, x1) - max(low, x0)
         if overlap > widest:
             best, widest = text, overlap
@@ -1024,7 +1097,7 @@ def _items_from_columns(doc: Document) -> List[LineItem]:
     items: List[LineItem] = []
     for rows in doc.word_rows:
         for index, row in enumerate(rows):
-            columns = _match_column_header(row)
+            columns = _match_column_header(row, rows[index - 1] if index else None)
             if not columns:
                 continue
             items.extend(_read_column_rows(rows[index + 1 :], columns))
@@ -1033,17 +1106,21 @@ def _items_from_columns(doc: Document) -> List[LineItem]:
     return items
 
 
-def _match_column_header(row: List[dict]) -> Optional[Dict[str, Tuple[float, float]]]:
-    """Map fields to x-ranges when this row looks like an item-table header."""
-    hits: List[Tuple[str, dict]] = []
-    for word in row:
-        text = word["text"].strip().lower().strip(".:")
-        for name, hint in COLUMN_HINTS.items():
-            if any(name == found for found, _ in hits):
-                continue
-            if re.match(hint, text):
-                hits.append((name, word))
-                break
+def _match_column_header(
+    row: List[dict], above: Optional[List[dict]] = None
+) -> Optional[Dict[str, Tuple[float, float]]]:
+    """Map fields to x-ranges when this row looks like an item-table header.
+
+    A heading can be set over two lines to keep the column narrow — "Eenh"
+    above "Prijs", "Bedrag EUR" above "excl. BTW" — so the row above is read
+    too, but only for the fields this row does not already name. The lower line
+    is the one that counts: "Eenheden" is the quantity, and "Eenh" over the
+    price column is the other half of "eenheidsprijs".
+    """
+    hits = _column_hits(row)
+    if above:
+        named = {name for name, _ in hits}
+        hits += [hit for hit in _column_hits(above) if hit[0] not in named]
 
     names = {name for name, _ in hits}
     if "amount" not in names or len(hits) < 3:
@@ -1062,6 +1139,20 @@ def _match_column_header(row: List[dict]) -> Optional[Dict[str, Tuple[float, flo
     return columns
 
 
+def _column_hits(row: List[dict]) -> List[Tuple[str, dict]]:
+    """The fields this row's words name, one word per field, in reading order."""
+    hits: List[Tuple[str, dict]] = []
+    for word in row:
+        text = word["text"].strip().lower().strip(".:")
+        for name, hint in COLUMN_HINTS.items():
+            if any(name == found for found, _ in hits):
+                continue
+            if re.match(hint, text):
+                hits.append((name, word))
+                break
+    return hits
+
+
 _NUMERIC_COLUMNS = ("quantity", "unit_price", "tax_rate", "amount")
 
 
@@ -1070,18 +1161,28 @@ def _read_column_rows(
 ) -> List[LineItem]:
     """Read item rows below a header.
 
-    Numbers are matched to their columns right-to-left rather than by x-range:
-    numeric columns are right-aligned under left-aligned headers, so their
-    values rarely sit within the header's own span. The amount column is the
-    rightmost one, which makes the alignment reliable even when a row omits a
-    quantity or price.
+    To the right of the description, numbers are matched to their columns
+    right-to-left rather than by x-range: those columns are right-aligned under
+    left-aligned headings, so a value sits well right of its own heading and
+    often past the next one. Counting from the amount — always the rightmost —
+    keeps them straight even when a row omits a quantity or a price.
+
+    That counting only works while every numeric column is to the right of the
+    description, and not every table is built that way: a fuel card puts
+    "Eenheden" in front of "Product", and counting from the right would then
+    shift every field by one. Columns before the description are read by
+    position instead, where left-aligned values do sit under their heading.
     """
-    numeric_order = [
-        name
-        for name in sorted(columns, key=lambda n: columns[n][0])
-        if name in _NUMERIC_COLUMNS
+    ordered = sorted(columns.items(), key=lambda pair: pair[1][0])
+    text_start, text_boundary = columns.get("description", (0.0, 0.0))
+    before_text = [
+        (name, span) for name, span in ordered
+        if name in _NUMERIC_COLUMNS and span[1] <= text_start
     ]
-    text_boundary = columns.get("description", (0.0, 0.0))[1]
+    after_text = [
+        name for name, span in ordered
+        if name in _NUMERIC_COLUMNS and span[0] >= text_boundary
+    ]
 
     items: List[LineItem] = []
     for row in rows:
@@ -1091,11 +1192,21 @@ def _read_column_rows(
         words: List[str] = []
         numbers: List[str] = []
         percents: List[str] = []
+        leading: Dict[str, str] = {}
         for word in row:
             token = word["text"]
             centre = (word["x0"] + word["x1"]) / 2
             if centre < text_boundary:
-                words.append(token)
+                column = next(
+                    (n for n, (low, high) in before_text if low <= centre < high),
+                    None,
+                )
+                if column is None:
+                    words.append(token)
+                elif _PERCENT.fullmatch(token) or amount_tokens(token):
+                    # "47,90 Ltr" puts the unit beside the quantity, and the
+                    # station name a column further left; only numbers count.
+                    leading[column] = token
             elif _PERCENT.fullmatch(token):
                 percents.append(token)
             elif amount_tokens(token):
@@ -1103,11 +1214,11 @@ def _read_column_rows(
             else:
                 words.append(token)
 
-        cells = {"description": " ".join(words).strip()}
+        cells = {"description": " ".join(words).strip(), **leading}
         if percents:
             cells["tax_rate"] = percents[-1]
 
-        targets = [n for n in numeric_order if n != "tax_rate" or not percents]
+        targets = [n for n in after_text if n != "tax_rate" or not percents]
         for name, token in zip(reversed(targets), reversed(numbers)):
             cells[name] = token
 
@@ -1134,13 +1245,41 @@ def _cells_to_item(cells: Dict[str, str]) -> Optional[LineItem]:
         bare = _single_amount(cells.get("tax_rate", ""))
         rate = bare if bare is not None and 0 <= bare <= 30 else None
 
+    quantity = _single_amount(cells.get("quantity", ""))
+    unit_price = _single_amount(cells.get("unit_price", ""))
     return LineItem(
         description=description,
-        quantity=_single_amount(cells.get("quantity", "")),
-        unit_price=_single_amount(cells.get("unit_price", "")),
+        quantity=quantity,
+        unit_price=_price_the_line_agrees_with(
+            quantity, unit_price, amount, cells.get("unit_price", "")
+        ),
         tax_rate=rate,
         amount=amount,
     )
+
+
+def _price_the_line_agrees_with(
+    quantity: Optional[float],
+    unit_price: Optional[float],
+    amount: float,
+    token: str,
+) -> Optional[float]:
+    """Re-read a unit price whose comma was taken for a thousands separator.
+
+    Nothing in "1,938" says whether it is one thousand nine hundred and
+    thirty-eight or one and a bit — a fuel price per litre is written exactly
+    like that. The line says which: 47,90 litres at 1.938 comes to the 92,82
+    charged, and at 1938 to ninety-two thousand.
+    """
+    if unit_price is None or quantity is None or not quantity:
+        return unit_price
+    tolerance = max(0.02, abs(amount) * 0.001)
+    if abs(quantity * unit_price - amount) <= tolerance:
+        return unit_price
+    as_decimal = parse_amount(token, decimal_comma=True)
+    if as_decimal is not None and abs(quantity * as_decimal - amount) <= tolerance:
+        return as_decimal
+    return unit_price
 
 
 def _single_amount(text: str) -> Optional[float]:
