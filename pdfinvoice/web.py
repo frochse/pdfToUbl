@@ -65,16 +65,18 @@ def create_app(mail_to: str = DEFAULT_MAIL_TO) -> Flask:
 
     @app.post("/api/email")
     def api_email():
-        """Open a draft in Mail with the PDF and its UBL attached.
+        """Open a draft in Mail with the UBL attached — and only the UBL.
 
-        The browser sends the PDF back rather than the server keeping it: this
+        The PDF is inside it already, base64 in AdditionalDocumentReference,
+        and that is where Exact takes the invoice image from. Sent alongside
+        as a second attachment it becomes a second document in the purchase
+        inbox: one invoice arriving twice.
+
+        The browser sends the UBL back rather than the server keeping it: this
         app holds nothing between requests, and a draft can be asked for long
         after the parse.
         """
-        upload = request.files.get("file")
         ubl_xml = request.form.get("ubl")
-        if not upload or not upload.filename:
-            return jsonify(error="het PDF-bestand ontbreekt"), 400
         if not ubl_xml:
             return jsonify(error="de UBL ontbreekt"), 400
 
@@ -82,18 +84,16 @@ def create_app(mail_to: str = DEFAULT_MAIL_TO) -> Flask:
         if "@" not in recipient:
             return jsonify(error="geen geldig e-mailadres opgegeven"), 400
 
-        name = secure_filename(upload.filename) or "factuur.pdf"
-        stem = Path(secure_filename(request.form.get("stem") or name)).stem
+        stem = Path(secure_filename(request.form.get("stem") or "factuur")).stem
         subject = request.form.get("subject") or f"Factuur {stem}"
         body = request.form.get("body") or (
-            "Bijgaand de factuur als PDF en het bijbehorende UBL-bestand.\n"
+            "Bijgaand de factuur als UBL. De PDF zit als bijlage in het "
+            "UBL-bestand zelf.\n"
         )
 
         try:
             directory = mailer.outbox()
-            attachments = mailer.write_attachments(
-                directory, upload.read(), name, ubl_xml, f"{stem}.xml"
-            )
+            attachments = [mailer.write_ubl(directory, ubl_xml, f"{stem}.xml")]
             mailer.compose(recipient, subject, body, attachments)
         except mailer.MailError as exc:
             return jsonify(error=str(exc)), 503

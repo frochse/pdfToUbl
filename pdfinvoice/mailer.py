@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Sequence
 
 # Paths arrive as arguments rather than baked into the source: a filename with
 # a quote in it would otherwise end the string and run as script.
@@ -109,21 +109,14 @@ def _explain(stderr: str) -> str:
     return f"Mail gaf een fout: {message}"
 
 
-def write_attachments(
-    directory: Path,
-    pdf_bytes: Optional[bytes],
-    pdf_name: str,
-    ubl_xml: Optional[str],
-    ubl_name: str,
-) -> List[Path]:
-    """Put the PDF and the UBL side by side, ready to attach."""
-    written: List[Path] = []
-    if pdf_bytes:
-        pdf_path = directory / pdf_name
-        pdf_path.write_bytes(pdf_bytes)
-        written.append(pdf_path)
-    if ubl_xml:
-        ubl_path = directory / ubl_name
-        ubl_path.write_text(ubl_xml, encoding="utf-8")
-        written.append(ubl_path)
-    return written
+def write_ubl(directory: Path, ubl_xml: str, name: str) -> Path:
+    """Put the UBL ready to attach, and say where it is.
+
+    Only the UBL. The PDF travels inside it, base64 in
+    AdditionalDocumentReference, which is where Exact reads the invoice image
+    from — attaching it a second time makes the purchase inbox open two
+    documents for one invoice, one from each attachment.
+    """
+    path = directory / name
+    path.write_text(ubl_xml, encoding="utf-8")
+    return path

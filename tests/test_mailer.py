@@ -1,4 +1,3 @@
-import io
 import subprocess
 from pathlib import Path
 
@@ -51,14 +50,11 @@ def test_a_denied_automation_prompt_is_explained(tmp_path):
         mailer.compose("a@b.nl", "s", "b", [pdf], runner=runner)
 
 
-def test_both_attachments_are_written(tmp_path):
-    written = mailer.write_attachments(
-        tmp_path, b"%PDF-1.4 x", "factuur.pdf", "<Invoice/>", "F123.xml"
-    )
+def test_the_ubl_is_written_ready_to_attach(tmp_path):
+    written = mailer.write_ubl(tmp_path, "<Invoice/>", "F123.xml")
 
-    assert [p.name for p in written] == ["factuur.pdf", "F123.xml"]
-    assert (tmp_path / "factuur.pdf").read_bytes() == b"%PDF-1.4 x"
-    assert (tmp_path / "F123.xml").read_text(encoding="utf-8") == "<Invoice/>"
+    assert written.name == "F123.xml"
+    assert written.read_text(encoding="utf-8") == "<Invoice/>"
 
 
 def test_the_outbox_sweeps_what_a_previous_run_left(tmp_path, monkeypatch):
@@ -77,8 +73,7 @@ def test_the_outbox_sweeps_what_a_previous_run_left(tmp_path, monkeypatch):
 
 
 def _post(client, **fields):
-    data = {"file": (io.BytesIO(b"%PDF-1.4 x"), "factuur.pdf"),
-            "ubl": "<Invoice/>", "recipient": "inkoop@example.nl"}
+    data = {"ubl": "<Invoice/>", "recipient": "inkoop@example.nl"}
     data.update(fields)
     return client.post("/api/email", data=data,
                        content_type="multipart/form-data")
@@ -90,7 +85,9 @@ def test_the_default_recipient_reaches_the_page():
         assert b'value="inkoop@example.nl"' in client.get("/").data
 
 
-def test_a_draft_is_requested_with_both_attachments(monkeypatch, tmp_path):
+def test_a_draft_carries_the_ubl_and_nothing_else(monkeypatch, tmp_path):
+    """The PDF is inside the UBL; attached again it becomes a second document
+    in the purchase inbox, and one invoice arrives twice."""
     seen = {}
 
     def fake_compose(recipient, subject, body, attachments, **kw):
@@ -106,8 +103,8 @@ def test_a_draft_is_requested_with_both_attachments(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert seen["recipient"] == "inkoop@example.nl"
-    assert seen["names"] == ["factuur.pdf", "F4353326.xml"]
-    assert response.get_json()["attachments"] == ["factuur.pdf", "F4353326.xml"]
+    assert seen["names"] == ["F4353326.xml"]
+    assert response.get_json()["attachments"] == ["F4353326.xml"]
 
 
 def test_a_bad_address_is_refused_before_mail_is_touched(monkeypatch):

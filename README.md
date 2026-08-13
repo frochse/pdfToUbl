@@ -152,10 +152,16 @@ installed.
 
 ### Mailing an invoice to Exact (macOS)
 
-Each invoice card has a **Mail PDF + UBL** button. It opens a draft in Apple
-Mail with both files attached, addressed to whatever is in the *Mailen naar*
-field. That field is prefilled with the purchase inbox of your accounting
-package, once you have said what it is:
+Each invoice card has a **Mail UBL** button. It opens a draft in Apple Mail
+with the UBL attached, addressed to whatever is in the *Mailen naar* field.
+
+Only the UBL: the PDF is inside it, base64 in `AdditionalDocumentReference`,
+and that is where Exact takes the invoice image from. Attached a second time it
+becomes a second document in the purchase inbox — one invoice arriving twice,
+once as structured data and once as a bare scan.
+
+That field is prefilled with the purchase inbox of your accounting package,
+once you have said what it is:
 
 ```sh
 pdfinvoice-web --set-mail-to 12ab34cd@inkoop.exactonline.nl   # once

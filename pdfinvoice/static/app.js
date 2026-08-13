@@ -8,10 +8,6 @@ const summary = document.getElementById("summary");
 const results = document.getElementById("results");
 
 let state = { results: [], csv: "" };
-// The uploaded PDFs, kept so they can be attached to a mail later. The server
-// stores nothing between requests, so the file has to come from here. Results
-// arrive in upload order, which is what lines the two up.
-let uploaded = [];
 const mailAvailable = document.body.dataset.mailAvailable === "yes";
 
 document.getElementById("browse").addEventListener("click", () => picker.click());
@@ -33,7 +29,6 @@ drop.addEventListener("drop", (e) => upload(e.dataTransfer.files));
 
 document.getElementById("clear").addEventListener("click", () => {
   state = { results: [], csv: "" };
-  uploaded = [];
   results.replaceChildren();
   toolbar.hidden = true;
   setStatus(null);
@@ -52,7 +47,6 @@ async function upload(fileList) {
   }
 
   const body = new FormData();
-  uploaded = files;
   files.forEach((file) => body.append("files", file));
   body.append("date_order", document.getElementById("date-order").value);
   body.append("ocr", document.getElementById("ocr").value);
@@ -87,7 +81,7 @@ function setStatus(text, isError = false) {
 
 function render(payload) {
   results.replaceChildren();
-  payload.results.forEach((entry, index) => results.append(card(entry, index)));
+  payload.results.forEach((entry) => results.append(card(entry)));
 
   const ok = payload.results.filter((r) => r.ok);
   const flagged = ok.filter((r) => r.invoice.warnings.length).length;
@@ -98,7 +92,7 @@ function render(payload) {
   setStatus(null);
 }
 
-function card(entry, index) {
+function card(entry) {
   const root = el("article", "card");
 
   if (!entry.ok) {
@@ -141,7 +135,7 @@ function card(entry, index) {
   ];
 
   if (mailAvailable) {
-    root.append(mailBar(entry, index));
+    root.append(mailBar(entry));
   }
 
   const tabs = el("div", "tabs");
@@ -177,23 +171,19 @@ function badge(kind, text) {
   return el("span", `badge ${kind}`, text);
 }
 
-function mailBar(entry, index) {
+function mailBar(entry) {
   const bar = el("div", "mail-bar");
   const note = el("span", "mail-note", "");
 
   const button = document.createElement("button");
   button.type = "button";
-  button.textContent = "Mail PDF + UBL";
+  // Only the UBL: the PDF is embedded in it, and a second attachment makes
+  // the purchase inbox open a second document for the same invoice.
+  button.textContent = "Mail UBL";
   button.addEventListener("click", async () => {
     const recipient = document.getElementById("mail-to").value.trim();
-    const file = uploaded[index];
-    if (!file) {
-      note.textContent = "Het PDF-bestand is niet meer beschikbaar; upload opnieuw.";
-      return;
-    }
 
     const body = new FormData();
-    body.append("file", file);
     body.append("ubl", entry.ubl);
     body.append("recipient", recipient);
     body.append("stem", stem(entry.invoice, entry.file));
