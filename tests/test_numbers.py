@@ -84,3 +84,11 @@ def test_three_digits_after_a_comma_are_thousands_unless_told_otherwise():
     assert parse_amount("1.234,56", decimal_comma=True) == 1234.56
     assert parse_amount("47,90", decimal_comma=True) == 47.90
     assert parse_amount("1,234,567", decimal_comma=True) == 1234567.0
+
+
+def test_a_month_and_a_year_are_a_period_and_not_an_amount():
+    """"Maandelijkse kosten juli 2026" heads a column of prices; the year is
+    four digits of the shape money has."""
+    assert "2026" not in strip_dates("Maandelijkse kosten juli 2026 Aantal Totaal")
+    assert "2026" not in strip_dates("Verbruik tot en met 30 juni 2026")
+    assert strip_dates("Bedrag 2026,00") == "Bedrag 2026,00"

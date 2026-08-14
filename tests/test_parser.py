@@ -4,8 +4,9 @@ import pdfinvoice
 from pdfinvoice.model import Invoice
 from pdfinvoice.parser import (_assign_vat_numbers, _clean_party_name,
                                _customer_vat_numbers,
-                               _find_iban, _find_vat_ids,
-                               _guess_supplier_block, _items_from_text,
+                               _find_bic, _find_iban, _find_vat_ids,
+                               _guess_supplier_block, _items_from_summary,
+                               _items_from_text,
                                _letterhead_pieces, _looks_like_labelled_field,
                                _overlapping_segment, _segments,
                                _split_name_from_address, _strip_trailing_label)
@@ -651,3 +652,295 @@ def test_a_labelled_field_is_not_a_company_name():
     assert _looks_like_labelled_field("Invoice number ORF67LFJ0002")
     assert not _looks_like_labelled_field("Anthropic, PBC")
     assert not _looks_like_labelled_field("Elasticsearch BV")
+
+
+# The summary a telephone bill prints on page one, above the pages of
+# specification that detail it.
+_SUMMARY = (
+    "Samenvatting\n"
+    "Product Bruto Netto\n"
+    "Internet € 49,73 € 49,73\n"
+    "Mobiel € 46,11 € 46,11\n"
+    "TV € 11,88 € 11,88\n"
+    "Totaal € 107,72 € 107,72\n"
+    "Btw 21% over € 107,72 € 22,62\n"
+    "Totaal inclusief btw € 130,34\n"
+)
+
+
+def test_the_summary_block_is_the_item_table():
+    """None of the rows on the specification pages is a line to book — the
+    same money is set out once per service and once per location. The three
+    the invoice summarises itself are, and they add up to its total."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurnummer 151138572\n"
+        "Factuurdatum 16 juli 2026\n"
+        + _SUMMARY +
+        "Specificatie per dienst\n"
+        "Maandelijkse kosten juli 2026 Aantal Tarief Totaal\n"
+        "KPN Box 12 1,00 0,00 0,00\n"
+        "KPN ÉÉN Internet tot 200 Mbps Standaard 1,00 69,73 69,73\n"
+        "Totaal Internet € 49,73\n"
+    ))
+
+    assert [(line.description, line.amount) for line in inv.lines] == [
+        ("Internet", 49.73), ("Mobiel", 46.11), ("TV", 11.88)
+    ]
+    assert (inv.total_net, inv.total_tax, inv.total_gross) == (107.72, 22.62, 130.34)
+    assert inv.warnings == []
+
+
+def test_a_summary_whose_rows_miss_the_total_is_not_believed():
+    """The block is only the item table when it accounts for the whole invoice.
+    A summary of part of it leaves the specification to be read as before."""
+    items = _items_from_summary(_doc(
+        "Samenvatting\n"
+        "Product Bruto Netto\n"
+        "Internet € 49,73 € 49,73\n"
+        "Totaal € 107,72 € 107,72\n"
+    ))
+
+    assert items == []
+
+
+def test_a_month_and_a_year_over_a_column_are_not_a_net_total():
+    """"Korting juli 2026 Aantal Tarief Netto Totaal" heads four columns on a
+    specification page. Read as money it makes the year the net total, and the
+    invoice then says 2026,00 excluding VAT."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurnummer 151138572\n"
+        "Factuurdatum 16 juli 2026\n"
+        "Totaal € 107,72 € 107,72\n"
+        "Btw 21% over € 107,72 € 22,62\n"
+        "Totaal inclusief btw € 130,34\n"
+        "Korting juli 2026 Aantal Tarief Netto Totaal\n"
+        "Breedband Voordeel Mobiel 1,00 -20,00 -20,00 -20,00\n"
+    ))
+
+    assert inv.total_net == 107.72
+
+
+def test_a_label_set_tight_against_its_colon_ends_the_value():
+    """"Factuurnummer: 26800059 Betaaltermijn: 14 dagen" is two columns. The
+    payment term travels into Exact stuck to the invoice number otherwise."""
+    assert _strip_trailing_label("26800059 Betaaltermijn: 14 dagen") == "26800059"
+    assert _strip_trailing_label("2264 Vervaldatum: 27-7-2026") == "2264"
+    # A colon inside the value is not a following label: "OR:" is part of the
+    # reference, and the digits after it are what is being referred to.
+    assert _strip_trailing_label("OR: 26-90009") == "OR: 26-90009"
+
+
+def test_a_blank_field_over_a_letterhead_is_not_the_company():
+    """A letterhead opening with "Afdeling:" and nothing after it. Read as the
+    name it becomes the creditor, and pushes the company into the street."""
+    name, address = _guess_supplier_block(
+        "Afdeling:\n"
+        "De Meesters Glas Interieurbeglazing B.V.\n"
+        "Radioweg 16\n"
+        "1324 KP ALMERE\n"
+        "Nederland\n"
+        "Tel: +3136 785 8688\n"
+    )
+
+    assert name == "De Meesters Glas Interieurbeglazing B.V."
+    assert address == ["Radioweg 16", "1324 KP ALMERE", "Nederland"]
+
+
+def test_a_date_that_is_already_the_due_date_is_not_the_invoice_date():
+    """The text layer of one invoice breaks the label apart: pdfplumber returns
+    "F: actuurdatum: 13-7-2026". Nothing labels the invoice date any more, and
+    the first date on the page is the due date printed the line above."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurnummer: 26800059 Betaaltermijn: 14 dagen\n"
+        "Debiteurnummer 2264 Vervaldatum: 27-7-2026\n"
+        "F: actuurdatum: 13-7-2026 Referentie: OR: 26-90009\n"
+    ))
+
+    assert inv.due_date == date(2026, 7, 27)
+    assert inv.invoice_date == date(2026, 7, 13)
+
+
+def test_the_only_date_there_is_stays_the_invoice_date():
+    """Payable on receipt: the two are the same day, and passing it over would
+    leave the invoice with no date at all."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuurnummer: 26800059\n"
+        "Vervaldatum: 27-7-2026\n"
+    ))
+
+    assert inv.invoice_date == date(2026, 7, 27)
+
+
+# An item table with a wrapped description under the first row, the credit
+# lines that close it, and a note between two of them. Positions are the ones
+# pdfplumber reports for the invoice this was taken from.
+_WRAPPED_ITEM_TABLE = [
+    [("Omschrijving", 27.8, 88.6), ("BTW%", 372.0, 397.6), ("Aantal", 415.2, 446.9),
+     ("Prijs", 470.5, 495.0), ("Subtotaal", 517.5, 564.0)],
+    [("Product", 27.8, 58.7), ("21%", 372.0, 390.0), ("1", 427.7, 432.7),
+     ("€", 448.7, 455.5), ("3.490,00", 457.7, 492.7), ("€", 503.5, 510.2),
+     ("3.490,00", 529.0, 564.0)],
+    [("-", 27.8, 30.7), ("17m1", 33.2, 55.7), ("beglazingspakket", 60.7, 130.3),
+     ("t.b.v.", 133.0, 152.4), ("88.4", 222.2, 239.7), ("–", 242.2, 249.0),
+     ("40x30x1;", 251.5, 288.0)],
+    [("Aanbetalingsfactuur", 27.8, 120.4), ("21%", 372.0, 390.0),
+     ("-1", 424.7, 432.7), ("€", 448.7, 455.5), ("3.998,75", 457.7, 492.7),
+     ("€", 500.0, 506.7), ("-3.998,75", 522.0, 564.0)],
+    [("BTW", 27.8, 47.0), ("hoog", 49.5, 71.0), ("tarief", 73.5, 97.0)],
+    [("Termijnfactuur", 27.8, 95.0), ("21%", 372.0, 390.0),
+     ("-1", 424.7, 432.7), ("€", 448.7, 455.5), ("6.283,75", 457.7, 492.7),
+     ("€", 500.0, 506.7), ("-6.283,75", 522.0, 564.0)],
+]
+
+
+def test_a_measurement_in_a_wrapped_description_is_not_a_line_amount():
+    """"17m1 beglazingspakket t.b.v. 88.4 – 40x30x1" runs past the end of the
+    description column. Counting numbers from the right says which one is the
+    amount, not that there is one: this row's is nowhere near the column the
+    amounts are printed in, so it is a continuation of the line above and the
+    measurement stays in the sentence it was printed in."""
+    inv = pdfinvoice.parse(_positioned_doc(_WRAPPED_ITEM_TABLE))
+
+    assert [line.amount for line in inv.lines] == [3490.00, -3998.75, -6283.75]
+    assert inv.lines[0].description == (
+        "Product - 17m1 beglazingspakket t.b.v. 88.4 – 40x30x1;"
+    )
+    assert [line.description for line in inv.lines[1:]] == [
+        "Aanbetalingsfactuur BTW hoog tarief", "Termijnfactuur"
+    ]
+
+
+def test_a_note_without_an_amount_does_not_end_the_item_table():
+    """"BTW hoog tarief" under a line says which rate it was charged at. The
+    totals block is what ends the table, and every row of that carries the
+    amount it totals."""
+    inv = pdfinvoice.parse(_positioned_doc(_WRAPPED_ITEM_TABLE))
+
+    assert inv.lines[-1].description == "Termijnfactuur"
+
+
+def test_the_currency_sign_is_not_part_of_the_description():
+    inv = pdfinvoice.parse(_positioned_doc(_WRAPPED_ITEM_TABLE))
+
+    assert "€" not in " ".join(line.description for line in inv.lines)
+
+
+def test_an_item_table_carries_on_under_its_header_on_the_next_page():
+    """A table too long for one page repeats its header on the next. Stopping
+    at the first page drops the credits at the end, which are exactly what
+    makes the lines come to the amount being charged."""
+    doc = _positioned_doc(_WRAPPED_ITEM_TABLE)
+    doc.word_rows.append(doc.word_rows[0])       # the same table, page two
+    doc.pages.append(doc.pages[0])
+
+    assert len(pdfinvoice.parse(doc).lines) == 6
+
+
+def test_the_invoice_is_addressed_with_factuur_aan():
+    """"Factuur aan:" is a label of its own, and the word "Factuur" under the
+    block is the title of the document rather than a line of the address."""
+    inv = pdfinvoice.parse(_doc(
+        "Factuur aan:\n"
+        "F. Ochse\n"
+        "Land in Zicht 9\n"
+        "1316 VJ Almere\n"
+        "Factuur\n"
+        "Factuurnummer: 26800059\n"
+    ))
+
+    assert inv.customer.name == "F. Ochse"
+    assert inv.customer.address == ["Land in Zicht 9", "1316 VJ Almere"]
+
+
+# The block an insurance broker prints under "Omschrijving": one charge, said
+# in six labelled rows, with the premium beside the first of them. Positions
+# are the ones the OCR'd page reports.
+_LABELLED_ITEM_BLOCK = [
+    [("Omschrijving", 73.3, 132.7), ("Bedrag", 491.1, 522.4)],
+    [("Factuurnummer", 73.6, 144.9), ("30801393", 195.3, 238.9),
+     ("€", 387.9, 393.0), ("126,09", 492.5, 522.0)],
+    [("Polisnummer", 73.6, 131.9), ("31242622", 195.3, 239.0)],
+    [("Soort", 73.1, 96.7), ("verzekering", 99.5, 150.7),
+     ("Personenauto", 195.7, 256.7)],
+    [("Omschrijving", 73.3, 131.0), ("BMW", 195.7, 219.6), ("Z4", 222.7, 232.7),
+     ("3.2", 236.2, 248.9), ("M", 252.9, 260.5)],
+    [("Kenteken", 73.6, 113.6), ("1-XHK-91", 195.7, 236.2)],
+    [("Totaal", 373.3, 401.2), ("€", 459.7, 465.0), ("126,09", 493.2, 522.7)],
+]
+
+
+def test_a_description_and_an_amount_are_a_table_of_their_own():
+    """"Omschrijving" over "Bedrag" and nothing else is the whole item table
+    on an invoice that charges for one thing. Asking for a third heading
+    leaves it unread."""
+    inv = pdfinvoice.parse(_positioned_doc(_LABELLED_ITEM_BLOCK))
+
+    assert [line.amount for line in inv.lines] == [126.09]
+
+
+def test_labelled_rows_without_an_amount_continue_the_line_above():
+    """The premium is charged on one row and then said in five — the policy,
+    what is insured, its registration. Dropped, the line that reaches Exact is
+    one nobody can place."""
+    inv = pdfinvoice.parse(_positioned_doc(_LABELLED_ITEM_BLOCK))
+
+    assert inv.lines[0].description == (
+        "Factuurnummer 30801393 Polisnummer 31242622 "
+        "Soort verzekering Personenauto Omschrijving BMW Z4 3.2 M "
+        "Kenteken 1-XHK-91"
+    )
+
+
+def test_an_amount_in_the_next_column_is_not_part_of_the_number():
+    """"Factuurnummer 30801393 € 126,09" is what the premium is charged under
+    and what it costs. Neither a currency sign nor cents belong to a
+    reference."""
+    assert _strip_trailing_label("30801393 € 126,09") == "30801393"
+    assert _strip_trailing_label("30801393 126,09") == "30801393"
+    # A reference is left alone: these are digits, not money.
+    assert _strip_trailing_label("8000 0001 5113 8572") == "8000 0001 5113 8572"
+
+
+# The foot of an insurance broker's stationery: four columns of details, of
+# which one is the address, above the small print.
+_FOOTER = [
+    [("035 - 623 89 40", 268.0, 337.0)],
+    [("Vaartweg 81", 45.3, 90.0), ("info@steijnborg.nl", 268.0, 340.0),
+     ("K.v.K. 32039196", 466.0, 535.0), ("Iban NL 24 INGB 0000 1687 56", 675.0, 830.0)],
+    [("1211 JG Hilversum", 45.3, 120.0), ("www.steijnborg.nl", 268.0, 340.0),
+     ("AFM 12004671", 466.0, 528.0), ("BIC code INGB NL 2A", 675.0, 770.0)],
+    [("Op onze dienstverlening zijn onze algemene voorwaarden van toepassing.",
+      45.3, 830.0)],
+]
+
+
+def test_the_address_is_taken_from_the_footer_when_the_top_has_none():
+    """An invoice whose letterhead is a logo: OCR reads the drawing as a word
+    or two, and nothing above the item table is an address. The foot of the
+    page states the company — beside the KvK number and the bank, which are
+    already read from there."""
+    inv = pdfinvoice.parse(_positioned_doc(
+        [[("AVA STEITNBORG", 268.0, 400.0)],
+         [("Factuur", 45.3, 90.0)]] + _LABELLED_ITEM_BLOCK + _FOOTER
+    ))
+
+    assert inv.supplier.address == ["Vaartweg 81", "1211 JG Hilversum"]
+
+
+def test_the_footer_keeps_only_what_is_an_address():
+    """Every other column has a field of its own: the telephone number, the
+    website, the registrations and the bank. In the street they would travel
+    into Exact as part of the address."""
+    inv = pdfinvoice.parse(_positioned_doc(_FOOTER))
+
+    assert inv.supplier.address == ["Vaartweg 81", "1211 JG Hilversum"]
+
+
+def test_a_bank_code_printed_in_pieces_is_still_read():
+    """"BIC code INGB NL 2A" carries a word in the label and spaces in the
+    value, and the registration in the column before it must not be run into
+    the label when those spaces are closed up."""
+    assert _find_bic("AFM 12004671 BIC code INGB NL 2A") == "INGBNL2A"
+    assert _find_bic("IBAN NL91 ABNA 0417 1643 00 BIC ABNANL2A") == "ABNANL2A"
+    # A word after the label is not a code, however much it looks like one.
+    assert _find_bic("swift van deze rekening is onbekend") is None

@@ -40,7 +40,7 @@ _ATTENTION_HEADERS = re.compile(
 )
 _CUSTOMER_HEADERS = re.compile(
     r"^\s*(bill(?:ed)?\s*to|invoice\s*to|sold\s*to|ship\s*to|customer|client|"
-    r"factuuradres|factureren\s*aan|geadresseerde|t\.?a\.?v\.?|"
+    r"factuuradres|factu(?:ur|reren)\s*aan|geadresseerde|t\.?a\.?v\.?|"
     rf"rechnungsempf(?:ä|ae)nger|kunde){_HEADER_SEPARATOR}(.*)$",
     re.IGNORECASE,
 )
@@ -48,7 +48,7 @@ _CUSTOMER_HEADERS = re.compile(
 # delivery address, and it sits beside the billing one on invoices with both.
 _BILLING_HEADERS = re.compile(
     r"^\s*(bill(?:ed)?\s*to|invoice\s*to|sold\s*to|"
-    r"factuuradres|factureren\s*aan|geadresseerde|t\.?a\.?v\.?|"
+    r"factuuradres|factu(?:ur|reren)\s*aan|geadresseerde|t\.?a\.?v\.?|"
     rf"rechnungsempf(?:ä|ae)nger){_HEADER_SEPARATOR}(.*)$",
     re.IGNORECASE,
 )
@@ -65,7 +65,8 @@ COLUMN_HINTS = {
     "unit_price": r"^(unit|price|prijs|stukprijs|tarief|rate|preis|"
                   r"unitprice|per)$",
     "tax_rate": r"^(vat|btw|tax|mwst|vat%|btw%)$",
-    "amount": r"^(amount|total|totaal|bedrag|betrag|line|subtotal|sum)$",
+    "amount": r"^(amount|total|totaal|bedrag|betrag|line|subtotal|subtotaal|"
+              r"sum)$",
     "description": r"^(description|omschrijving|artikel|item|items|product|"
                    r"bezeichnung|dienst|werkzaamheden|specificatie)$",
 }
@@ -101,15 +102,21 @@ def _parse_scalars(inv: Invoice, doc: Document, day_first: bool) -> None:
     _fields_under_column_headings(inv, doc, day_first)
 
     if inv.invoice_date is None:
-        # Last resort: the first date-looking string anywhere in the document.
-        for line in lines:
-            found = parse_date(line, day_first=day_first)
-            if found:
-                inv.invoice_date = found
-                inv.warnings.append(
-                    "invoice_date was not labelled; used first date in document"
-                )
-                break
+        # Last resort: the first date-looking string anywhere in the document,
+        # passing over any that is already another field's. A text layer can
+        # break a label apart — "F: actuurdatum: 13-7-2026" is what pdfplumber
+        # returns for one invoice — and the first date on the page is then the
+        # due date printed the line above, which books the invoice a fortnight
+        # into the wrong period. Nothing else being available, the first date
+        # is still better than none.
+        dates = [date for date in (parse_date(line, day_first=day_first)
+                                   for line in lines) if date]
+        unclaimed = [date for date in dates if date != inv.due_date]
+        if dates:
+            inv.invoice_date = (unclaimed or dates)[0]
+            inv.warnings.append(
+                "invoice_date was not labelled; used first date in document"
+            )
 
     match = P.PAYMENT_REF_RE.search("\n".join(lines))
     if match:
@@ -216,11 +223,22 @@ def _strip_trailing_label(value: str) -> str:
     one line, and the wide gap between the columns does not always survive text
     extraction — so any label that follows, whatever it is called, ends the
     value as surely as a run of spaces does.
+
+    The space before that colon is optional, because the second column is as
+    often set tight against it: "Factuurnummer: 26800059 Betaaltermijn: 14
+    dagen" is an invoice number and a payment term, and read as one value the
+    number goes into Exact with the term stuck to it.
+
+    A column of amounts ends the value too, labelled or not: "Factuurnummer
+    30801393 € 126,09" is what the premium is charged under and what it costs.
+    Money is what it looks like — a currency sign, or a number with cents —
+    and neither of those is ever part of a reference.
     """
     cut = re.split(
         r"\s{3,}|\s+(?=(?:invoice|factuur|date|datum|due|verval|customer|klant|"
         r"order|page|pagina)\b)|"
-        r"\s+(?=[A-Za-z][\w.]*(?:\s+[\w.]+){0,3}\s+:)",
+        r"\s+(?=[€$£])|\s+(?=-?\d[\d.]*[.,]\d{2}\b)|"
+        r"\s+(?=[A-Za-z][\w.]*(?:\s+[\w.]+){0,3}\s*:)",
         value,
         maxsplit=1,
         flags=re.IGNORECASE,
@@ -369,9 +387,7 @@ def _parse_parties(inv: Invoice, doc: Document) -> None:
     if emails:
         inv.supplier.email = emails[0]
 
-    bic = re.search(r"(?:bic|swift)\s*[:#]?\s*([A-Z0-9]{8,11})\b", text, re.I)
-    if bic:
-        inv.supplier.bic = bic.group(1).upper()
+    inv.supplier.bic = _find_bic(text)
 
     # The letterhead is a column, and on an invoice that puts fields beside it
     # the flattened text runs the two together ("1016 ED Amsterdam Terms Due on
@@ -386,6 +402,13 @@ def _parse_parties(inv: Invoice, doc: Document) -> None:
         supplier_name, supplier_address = _guess_supplier_block(
             doc.pages[0] if doc.pages else ""
         )
+    if not any(_is_address_piece(line) for line in supplier_address):
+        # Whatever was read at the top of the page, none of it is an address.
+        # The foot of the page is the other place a company states itself, and
+        # on stationery the only one: the address stands there beside the KvK
+        # number, the VAT number and the bank, which are already taken from it.
+        supplier_address = _address_from_footer(doc) or supplier_address
+
     supplier_name = _registered_or_printed_name(inv, supplier_name)
     if not supplier_name and inv.supplier.coc_number:
         # Printed stationery carries the company name as a logo, which OCR
@@ -538,7 +561,7 @@ _SUPPLIER_HEADERS = re.compile(
 # preposition.
 _ADDRESSEE_HEADERS = re.compile(
     rf"^\s*(aan|contractant|bill(?:ed)?\s*to|invoice\s*to|sold\s*to|"
-    rf"factuuradres|factureren\s*aan|geadresseerde|"
+    rf"factuuradres|factu(?:ur|reren)\s*aan|geadresseerde|"
     rf"rechnungsempf(?:ä|ae)nger){_HEADER_SEPARATOR}(.*)$",
     re.IGNORECASE,
 )
@@ -675,6 +698,59 @@ def _supplier_block_from_columns(doc: Document) -> Tuple[Optional[str], List[str
     return name, address
 
 
+def _find_bic(text: str) -> Optional[str]:
+    """The bank code, however the footer it stands in spells it.
+
+    "BIC code INGB NL 2A" is one code in three pieces, behind a label that
+    carries a word of its own. Only what follows the label has its spaces
+    closed up, the way a VAT number's are: closing them across the whole line
+    would run the registration before it into the label — "AFM 12004671 BIC"
+    becomes "AFM12004671BIC" — and the label is then no longer a word. The
+    code is read case-sensitively, or "swift van deze rekening" is a bank code.
+    """
+    label = re.compile(
+        r"\b(?:bic|swift)\b\s*(?:code|nummer|nr\.?|no\.?)?\s*[:#]?\s*",
+        re.IGNORECASE,
+    )
+    for match in label.finditer(text):
+        tail = text[match.end():match.end() + 40]
+        found = P.BIC_RE.match(
+            re.sub(r"(?<=[A-Z0-9])[ ]+(?=[A-Z0-9])", "", tail)
+        )
+        if found:
+            return found.group(1).upper()
+    return None
+
+
+# How far up from the bottom of the page the footer reaches. Enough for the
+# columns of details and the small print under them.
+_FOOTER_ROWS = 8
+
+
+def _address_from_footer(doc: Document) -> List[str]:
+    """The company's address, out of the line of details at the foot of a page.
+
+        035 - 623 89 40
+        Vaartweg 81       info@steijnborg.nl  K.v.K. 32039196  Iban NL 24 ...
+        1211 JG Hilversum www.steijnborg.nl   AFM 12004671     BIC code INGB ...
+
+    Four columns, of which one is the address. The others each have a field of
+    their own already, so only the pieces that look like an address are kept —
+    a street with a number on it, a postcode with its town — and the telephone
+    number, the website and the registrations are left where they belong.
+    """
+    rows = doc.word_rows[-1] if doc.word_rows else []
+    address: List[str] = []
+    for row in rows[-_FOOTER_ROWS:]:
+        for _, _, text in _segments(row):
+            if _is_prose_line(text):
+                continue  # the small print about the terms of business
+            for piece in _letterhead_pieces(text):
+                if _is_address_piece(piece) and piece not in address:
+                    address.append(piece)
+    return address[:4]
+
+
 def _find_vat_ids(text: str) -> List[str]:
     """VAT numbers, whether or not they are printed with spaces in them.
 
@@ -778,13 +854,20 @@ def _is_prose_line(line: str) -> bool:
 
 
 def _is_letterhead_line(line: str) -> bool:
-    if not line or _HEADER_NOISE.match(line):
+    if not line or _HEADER_NOISE.match(line) or _EMPTY_LABEL.match(line):
         return False
     if not 2 <= len(line) <= 60:
         return False
     if not re.search(r"[A-Za-z]{2}", line):
         return False
     return not (P.EMAIL_RE.search(line) or re.match(r"^[\d\s.,/-]+$", line))
+
+
+# A field that was left blank: a label, a colon and nothing after it. Letterheads
+# open with one often enough — "Afdeling:" over the company name — and taken for
+# the name it becomes the creditor in Exact, with the company itself pushed down
+# into the street and the street into an extra address line.
+_EMPTY_LABEL = re.compile(r"^\s*[^:\n]{1,30}:\s*$")
 
 
 def _guess_customer_block(
@@ -810,6 +893,7 @@ def _guess_customer_block(
             follow = follow.strip()
             if (
                 not follow
+                or _HEADER_NOISE.match(follow)
                 or _TOTAL_WORDS.search(follow)
                 or _CUSTOMER_HEADERS.match(follow)
                 or _is_column_header_text(follow)
@@ -861,6 +945,9 @@ def _customer_block_from_columns(
                 text = _overlapping_segment(follow, span)
                 if (
                     not text
+                    # "Factuur" on its own under the address block is the title
+                    # of the document, not a line of the address.
+                    or _HEADER_NOISE.match(text)
                     or _TOTAL_WORDS.search(text)
                     or _is_column_header_text(text)
                     or _is_item_column_word(text)
@@ -1141,12 +1228,95 @@ def _find_iban(text: str) -> Optional[str]:
 
 
 def _parse_line_items(doc: Document) -> List[LineItem]:
-    """Try ruled tables, then column geometry, then a plain-text heuristic."""
-    for strategy in (_items_from_tables, _items_from_columns, _items_from_text):
+    """The invoice's own summary first, then ruled tables, then column
+    geometry, then a plain-text heuristic."""
+    for strategy in (
+        _items_from_summary,
+        _items_from_tables,
+        _items_from_columns,
+        _items_from_text,
+    ):
         items = strategy(doc)
         if items:
             return items
     return []
+
+
+# The heading over the block where an invoice says, in a few rows, what the
+# pages after it specify. Nothing else is allowed on the line: "Samenvatting
+# per kenteken" heads one summary among several, not the invoice's own.
+_SUMMARY_HEADING = re.compile(
+    r"^\s*(samenvatting|overzicht|recapitulatie|summary|zusammenfassung)\s*$",
+    re.IGNORECASE,
+)
+_CURRENCY_MARK = re.compile(r"^[€$£]$")
+
+
+def _items_from_summary(doc: Document) -> List[LineItem]:
+    """The rows of a summary block, when they add up to the total under them.
+
+        Samenvatting
+        Product              Bruto      Netto
+        Internet            € 49,73    € 49,73
+        Mobiel              € 46,11    € 46,11
+        TV                  € 11,88    € 11,88
+        Totaal             € 107,72   € 107,72
+        Btw 21% over € 107,72          € 22,62
+        Totaal inclusief btw          € 130,34
+
+    A telephone bill is pages of specification — subscriptions, discounts,
+    calls per destination, the same money once per service and once per
+    location — and none of those rows is a line to book. The three above are,
+    and the invoice says so itself by adding them up: the block is only read as
+    the item table when its rows come to the total printed under them, so a
+    summary that is a partial view of the invoice is left alone.
+    """
+    for index, line in enumerate(doc.lines):
+        if not _SUMMARY_HEADING.match(line):
+            continue
+        items = _summary_block(doc.lines[index + 1 : index + 40])
+        if items:
+            return items
+    return []
+
+
+def _summary_block(lines: List[str]) -> List[LineItem]:
+    """Read rows until the total that closes the block, and check them by it."""
+    rows: List[Tuple[str, float]] = []
+    for line in lines:
+        text, amounts = _summary_row(line)
+        # A total word with no amount beside it is a column heading: "Netto"
+        # over the column, not the netto total that ends the block.
+        if amounts and _TOTAL_WORDS.search(text):
+            total = amounts[-1]
+            if not rows or abs(sum(amount for _, amount in rows) - total) > 0.02:
+                return []
+            return [
+                LineItem(description=description, amount=amount)
+                for description, amount in rows
+            ]
+        if not amounts or not re.search(r"[A-Za-z]{2}", text):
+            continue  # the column headings, or a rule between the rows
+        # Bruto beside Netto: the right-hand column is the one that is charged,
+        # and the total below decides whether reading it that way was right.
+        rows.append((text, amounts[-1]))
+    return []
+
+
+def _summary_row(line: str) -> Tuple[str, List[float]]:
+    """A summary row split into what it charges for and the amounts beside it.
+
+    The description ends at the first amount, not at the last: the amounts are
+    set in columns with a currency sign in front of each, so peeling them off
+    the right leaves "Internet € 49,73 €" behind.
+    """
+    tokens = strip_dates(line).split()
+    cut = len(tokens)
+    for index, token in enumerate(tokens):
+        if _CURRENCY_MARK.match(token) or amount_tokens(token):
+            cut = index
+            break
+    return " ".join(tokens[:cut]), amount_tokens(" ".join(tokens[cut:]))
 
 
 def _items_from_tables(doc: Document) -> List[LineItem]:
@@ -1190,7 +1360,14 @@ def _cell_text(row: List, index: Optional[int]) -> str:
 
 
 def _items_from_columns(doc: Document) -> List[LineItem]:
-    """Rebuild the item table from word x-positions under its column headers."""
+    """Rebuild the item table from word x-positions under its column headers.
+
+    Every page is read, not only the first one that yields something. A table
+    that does not fit on a page carries on under a repeat of its own header on
+    the next, and stopping at the first page drops the rest of the invoice —
+    including the credited instalments at the end, which are what makes the
+    remaining lines add up to the amount being charged.
+    """
     items: List[LineItem] = []
     for rows in doc.word_rows:
         for index, row in enumerate(rows):
@@ -1198,8 +1375,7 @@ def _items_from_columns(doc: Document) -> List[LineItem]:
             if not columns:
                 continue
             items.extend(_read_column_rows(rows[index + 1 :], columns))
-            if items:
-                return items
+            break  # one item table per page; the rest of it is on the next
     return items
 
 
@@ -1219,8 +1395,15 @@ def _match_column_header(
         named = {name for name, _ in hits}
         hits += [hit for hit in _column_hits(above) if hit[0] not in named]
 
+    # Three headings, or the two that are a table on their own. "Omschrijving"
+    # over "Bedrag" and nothing else is the whole table on an invoice that
+    # charges for one thing; asking for a third heading leaves it unread. Two
+    # of anything else is too little to go on — "Datum" beside "Bedrag" is a
+    # payment history as easily as an item table.
     names = {name for name, _ in hits}
-    if "amount" not in names or len(hits) < 3:
+    if "amount" not in names:
+        return None
+    if len(hits) < 3 and names != {"description", "amount"}:
         return None
 
     hits.sort(key=lambda pair: pair[1]["x0"])
@@ -1283,16 +1466,24 @@ def _read_column_rows(
 
     items: List[LineItem] = []
     for row in rows:
-        if _TOTAL_WORDS.search(" ".join(word["text"] for word in row)):
+        text = " ".join(word["text"] for word in row)
+        # The totals block ends the table, and every row of it carries the
+        # amount it totals. A row that says "BTW hoog tarief" and nothing else
+        # is a note under the line above — the tax the line was charged at —
+        # and the table goes on beneath it.
+        if _TOTAL_WORDS.search(text) and amount_tokens(text):
             break
 
         words: List[str] = []
-        numbers: List[str] = []
+        numbers: List[Tuple[str, float]] = []  # the token and where it sits
+        slots: List[int] = []
         percents: List[str] = []
         leading: Dict[str, str] = {}
         for word in row:
             token = word["text"]
             centre = (word["x0"] + word["x1"]) / 2
+            if _CURRENCY_MARK.match(token):
+                continue  # a sign in front of each amount, not part of the name
             if centre < text_boundary:
                 column = next(
                     (n for n, (low, high) in before_text if low <= centre < high),
@@ -1307,22 +1498,60 @@ def _read_column_rows(
             elif _PERCENT.fullmatch(token):
                 percents.append(token)
             elif amount_tokens(token):
-                numbers.append(token)
+                slots.append(len(words))  # where it stands in the description
+                numbers.append((token, centre))
             else:
                 words.append(token)
+
+        # Counting from the right only says which number is the amount; it does
+        # not say that there is one. A description too long for its column runs
+        # past the end of it — "17m1 beglazingspakket t.b.v. 88.4 – 40x30x1" —
+        # and the measurement in it would be read as the line amount unless the
+        # rightmost number is where the amounts are printed. It belongs to the
+        # sentence it was taken out of, so it goes back where it came from.
+        if numbers and not _within(numbers[-1][1], columns.get("amount")):
+            for moved, ((token, _), slot) in enumerate(zip(numbers, slots)):
+                words.insert(slot + moved, token)
+            numbers = []
 
         cells = {"description": " ".join(words).strip(), **leading}
         if percents:
             cells["tax_rate"] = percents[-1]
 
         targets = [n for n in after_text if n != "tax_rate" or not percents]
-        for name, token in zip(reversed(targets), reversed(numbers)):
+        for name, (token, _) in zip(reversed(targets), reversed(numbers)):
             cells[name] = token
 
         item = _cells_to_item(cells)
         if item:
             items.append(item)
+        elif items and cells["description"] and not (numbers or percents):
+            # A row under the description column with no amount of its own
+            # continues the line above it. An insurance premium is charged on
+            # one row and then said in six — the policy, what is insured, the
+            # registration, the period — and dropping them leaves a line that
+            # nobody can place; a specification wrapped over several rows is
+            # the same shape.
+            items[-1].description = _joined_description(
+                items[-1].description, cells["description"]
+            )
     return items
+
+
+# Room for a description that runs on, and a stop before a line item turns into
+# a page of prose. UBL carries the name of what was bought, not its datasheet.
+_DESCRIPTION_LIMIT = 300
+
+
+def _joined_description(description: str, continuation: str) -> str:
+    if len(description) >= _DESCRIPTION_LIMIT:
+        return description
+    return f"{description} {continuation}".strip()
+
+
+def _within(centre: float, span: Optional[Tuple[float, float]]) -> bool:
+    """Whether a word sits in a column. No column at all takes anything."""
+    return span is None or span[0] <= centre < span[1]
 
 
 def _cells_to_item(cells: Dict[str, str]) -> Optional[LineItem]:

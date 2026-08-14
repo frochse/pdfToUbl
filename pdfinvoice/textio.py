@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pdfplumber
 
+from .numbers import money_tokens, written_with_decimals
+
 # A PDF text layer carries characters that are not text: NUL from a broken
 # encoding, form feeds between pages. They travel into every output format —
 # an invoice number of "ORF67LFJ\x000002" in CSV, and XML that no parser will
@@ -69,8 +71,7 @@ def extract(path: Path, ocr: str = "auto") -> Document:
     # VAT and bank details are part of the page picture. Rescanning the whole
     # page would put the item table through OCR too and misread amounts that
     # were already perfect, so only the picture is read, with --redo-ocr.
-    scanned = len(doc.text.strip()) < 40
-    if ocr == "always" or scanned:
+    if ocr == "always" or _no_values_in(doc.text):
         ocred = _ocr(path, redo=False)
     elif doc.image_only_band >= HIDDEN_TEXT_BAND:
         ocred = _ocr(path, redo=True)
@@ -85,6 +86,21 @@ def extract(path: Path, ocr: str = "auto") -> Document:
     # to embed the source in the UBL.
     ocred.path = path
     return ocred
+
+
+def _no_values_in(text: str) -> bool:
+    """Whether the text layer holds nothing worth parsing.
+
+    An empty one is the obvious case. The other is a page generated from a
+    template, which comes back as its own printed headings — "Omschrijving
+    Bedrag", "Totaal" — with every value it was filled in with unreadable, so
+    that the invoice looks like an invoice and says nothing. An amount with
+    cents in it is the test: every invoice prints at least one, and a text
+    layer that carries none is not carrying the invoice either.
+    """
+    return len(text.strip()) < 40 or not any(
+        written_with_decimals(token) for token, _ in money_tokens(text)
+    )
 
 
 def _extract_with_pdfplumber(path: Path) -> Document:

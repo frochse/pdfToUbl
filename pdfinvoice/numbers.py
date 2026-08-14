@@ -121,11 +121,6 @@ def written_with_decimals(token: str) -> bool:
     return bool(re.search(r"[.,]\d{1,2}\D*$", token))
 
 
-def strip_dates(text: str) -> str:
-    """Blank out dates so their digits are not mistaken for amounts."""
-    return _DATE_LIKE.sub(" ", text)
-
-
 def detect_currency(text: str) -> str | None:
     """Pick the most plausible currency for a document."""
     for code in ("EUR", "USD", "GBP", "CHF", "SEK", "NOK", "DKK", "PLN"):
@@ -160,6 +155,19 @@ _TEXT_DATE_DMY = re.compile(
 _TEXT_DATE_MDY = re.compile(
     r"\b([A-Za-z]{3,10})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(\d{4})\b"
 )
+# A month and a year name a period, not a day: "Maandelijkse kosten juli 2026".
+# The year is four digits of the shape an amount has, so a heading like that
+# reads as money unless the period is blanked out with the dates.
+_MONTH_AND_YEAR = re.compile(
+    r"\b(?:" + "|".join(sorted((m.strip() for m in _MONTHS), key=len, reverse=True))
+    + r")\.?\s+\d{4}\b",
+    re.IGNORECASE,
+)
+
+
+def strip_dates(text: str) -> str:
+    """Blank out dates so their digits are not mistaken for amounts."""
+    return _MONTH_AND_YEAR.sub(" ", _DATE_LIKE.sub(" ", text))
 
 
 def parse_date(text: str, day_first: bool = True) -> date | None:

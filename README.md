@@ -212,22 +212,44 @@ to add your own wording.
 
 - **Fields** come from labels (`Invoice no`, `Factuurnummer`, …); a label alone
   on a line takes the value from the line below, which is what two-column
-  headers look like once the PDF text layer is flattened.
+  headers look like once the PDF text layer is flattened. A value ends where the
+  next column's label begins, whatever that label is called. An unlabelled
+  invoice date falls back to the first date on the page, but never to one that
+  is already another field's — a text layer that breaks a label apart
+  (`F: actuurdatum:` is a real one) would otherwise book the invoice on its due
+  date.
 - **Totals** are classified per line rather than looked up by keyword, because
   "Total excl. VAT" is a net total, "Total incl. VAT" is not a VAT amount, and
   "Terms: Net 30" is neither. Explicit wording beats a bare "Total", and a value
   written with decimals beats a bare integer sharing the line.
-- **Line items** are read from ruled tables when the PDF has them; otherwise
-  from the x-positions of words under the column headers, mapping numbers to
+- **Line items** come from the invoice's own summary when it prints one. A
+  telephone bill is pages of specification — subscriptions, discounts, calls per
+  destination, the same money once per service and once per location — and none
+  of those rows is a line to book; the handful under `Samenvatting` are, and the
+  block is only read that way when its rows come to the total printed under
+  them. Failing that they are read from ruled tables when the PDF has them;
+  otherwise from the x-positions of words under the column headers, mapping to
   columns right-to-left (numeric columns are right-aligned under left-aligned
-  headers, so they rarely sit under their own header). A plain-text heuristic is
-  the last resort.
+  headers, so they rarely sit under their own header). That counting says which
+  number is the amount, not that there is one: a row whose rightmost number
+  misses the amount column is a description too long for its own column, and
+  continues the line above it instead — as does any row under the description
+  with no amount of its own, which is how an insurance premium charged on one
+  row and specified in six ends up on one bookable line. `Omschrijving` over
+  `Bedrag` with no third heading is a table too. Every page is read, since a
+  table that does not fit repeats its header on the next one. A plain-text
+  heuristic is the last resort.
 - **Supplier and customer** are read as columns, not as lines. A letterhead
   beside a field block flattens to `1016 ED Amsterdam Terms Due on receipt`, and
   an address header to `Date Billed to`, so the words' x-positions are used to
   pull each column apart. Columns are matched by overlap rather than by where
   they start, because a flush-right letterhead begins at a different x on every
   line. `Ship To` is never taken as the customer when a billing address exists.
+  When nothing above the item table is an address — stationery whose letterhead
+  is a logo — the supplier's address comes from the foot of the page, where a
+  Dutch invoice states itself: the street and postcode are kept and the columns
+  beside them left alone, the telephone number, website, KvK, AFM and bank each
+  having a field of their own.
 - **Numbers** are read in both `1.234,56` and `1,234.56` conventions. A space is
   never treated as a thousands separator: on an invoice it separates columns.
 
@@ -248,6 +270,13 @@ with the KvK, VAT and bank details is an image and only the fields the
 accounting package filled in are text. Such a page is read with `--redo-ocr`,
 which keeps the existing text exactly as it is and reads only the picture, so
 amounts that were already perfect are never put through OCR.
+
+And it runs on a page whose text layer carries no amount with cents in it. That
+is the other way a PDF can look readable and say nothing: an invoice generated
+from a form template extracts as the template's own printed headings —
+`Omschrijving Bedrag`, `Totaal` — with every value it was filled in with left
+unreadable. Every invoice prints at least one amount with cents, so a text layer
+without one is not carrying the invoice.
 
 Add the Dutch language pack (`brew install tesseract-lang`) — without it
 tesseract reads a Dutch letterhead in English and misreads more of it.
