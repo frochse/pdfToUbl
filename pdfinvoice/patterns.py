@@ -48,11 +48,16 @@ LABELS = {
         r"(?:uw\s*)?referentie",
         r"your\s*reference",
     ],
+    # Debtor number first: an invoice can carry both, and they are not the
+    # same. KPN prints "Debiteurnummer 18288583" beside "Klantnummer
+    # 7073386584" — the first is the account the invoice is booked against,
+    # the second the customer's number in a service system. Labels are tried
+    # in order, so the more accounting-like name has to come first.
     "customer_number": [
+        r"debiteur(?:en)?\s*(?:nummer|nr\.?)",
         r"customer\s*(?:no\.?|nr\.?|number|id|#)",
         r"client\s*(?:no\.?|number)",
         r"klant\s*(?:nummer|nr\.?|code)",
-        r"debiteur(?:en)?\s*(?:nummer|nr\.?)",
         r"kunden\s*(?:nummer|nr\.?)",
     ],
 }

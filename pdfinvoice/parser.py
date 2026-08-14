@@ -377,7 +377,11 @@ def _parse_parties(inv: Invoice, doc: Document) -> None:
     # the flattened text runs the two together ("1016 ED Amsterdam Terms Due on
     # receipt"). Word positions keep them apart; fall back to the plain text
     # when a PDF carries no usable geometry.
-    supplier_name, supplier_address = _supplier_block_from_columns(doc)
+    # An invoice that names its sender is believed over any reading of the
+    # letterhead, which is a guess about which block on the page is whose.
+    supplier_name, supplier_address = _party_block_from_label(doc, _SUPPLIER_HEADERS)
+    if not supplier_name:
+        supplier_name, supplier_address = _supplier_block_from_columns(doc)
     if not supplier_name and not supplier_address:
         supplier_name, supplier_address = _guess_supplier_block(
             doc.pages[0] if doc.pages else ""
@@ -397,7 +401,12 @@ def _parse_parties(inv: Invoice, doc: Document) -> None:
     # "Date  Billed to" and "Bill To  Ship To" both put the customer in a
     # column that the flattened text runs together with its neighbour, so the
     # geometry is tried first and the plain text is the fallback.
-    name, address, coc, contact = _customer_block_from_columns(doc)
+    name, address = _party_block_from_label(doc, _ADDRESSEE_HEADERS)
+    coc, contact = None, None
+    if name:
+        address, contact = _pull_contact(address)
+    else:
+        name, address, coc, contact = _customer_block_from_columns(doc)
     if not name:
         name, address, contact = _guess_customer_block(lines)
     if not name:
@@ -514,6 +523,94 @@ _POSTCODE_PIECE = re.compile(r"^\d{4,6}\s?[A-Z]{0,2}\s+\w", re.IGNORECASE)
 
 def _is_address_piece(text: str) -> bool:
     return bool(_STREET_START.search(text) or _POSTCODE_PIECE.match(text))
+
+
+# An invoice that names its sender outright. Worth more than any guess at the
+# letterhead: "Van" is deliberately absent, being half the Dutch surnames.
+_SUPPLIER_HEADERS = re.compile(
+    rf"^\s*(leverancier|supplier|vendor|verkoper|crediteur|lieferant)"
+    rf"{_HEADER_SEPARATOR}(.*)$",
+    re.IGNORECASE,
+)
+# And the party it is addressed to. "Aan" is here and not in _BILLING_HEADERS
+# because it only reads as a label in a list of fields, where a column of
+# labels stands beside a column of values; loose in a page of text it is a
+# preposition.
+_ADDRESSEE_HEADERS = re.compile(
+    rf"^\s*(aan|contractant|bill(?:ed)?\s*to|invoice\s*to|sold\s*to|"
+    rf"factuuradres|factureren\s*aan|geadresseerde|"
+    rf"rechnungsempf(?:ä|ae)nger){_HEADER_SEPARATOR}(.*)$",
+    re.IGNORECASE,
+)
+
+
+def _party_block_from_label(
+    doc: Document, headers: re.Pattern
+) -> Tuple[Optional[str], List[str]]:
+    """A party the invoice names outright, and the address under that name.
+
+    The label and the name sit in two columns of a list of fields:
+
+        Leverancier   KPN B.V.
+                      Wilhelminakade 123
+                      3072 AP Rotterdam
+        KvK nummer    27124701
+
+    So the address is the value column continued downwards, and it ends where
+    the label column speaks again — not at the first line that looks like an
+    identifier, because "27124701" alone does not, and not at the first line
+    holding an e-mail, because the block beside this one has one on it.
+    """
+    for rows in doc.word_rows:
+        for index, row in enumerate(rows):
+            found = _label_columns(row, headers)
+            if found is None:
+                continue
+            label_span, value_span, name = found
+
+            address: List[str] = []
+            for follow in rows[index + 1 : index + 8]:
+                if _overlapping_segment(follow, label_span):
+                    break  # the next field begins
+                text = _overlapping_segment(follow, value_span)
+                if text is None:
+                    continue
+                if _IDENTIFIER_LINE.search(text) or _find_vat_ids(text):
+                    break
+                address.append(text)
+                if len(address) == 4:
+                    break
+            if name:
+                return name, address
+    return None, []
+
+
+def _label_columns(
+    row: List[dict], headers: re.Pattern
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float], str]]:
+    """The label column, the value column and the name, on a labelled row.
+
+    The name is in the next column along, or behind the label in the same one
+    when the two were set close enough to read as one. What comes back has to
+    be able to be a party: KPN labels an e-mail address "Factuuradres", and no
+    company is called frochse@yahoo.com.
+    """
+    segments = _segments(row)
+    for position, (x0, x1, text) in enumerate(segments):
+        match = headers.match(text)
+        if not match:
+            continue
+        inline = _clean_party_name(match.group(2).strip())
+        if inline:
+            if _is_addressee_line(inline):
+                return (x0, x1), (x0, x1), inline
+            continue
+        if position + 1 < len(segments):
+            nx0, nx1, name = segments[position + 1]
+            name = _clean_party_name(name)
+            if name and _is_addressee_line(name):
+                return (x0, x1), (nx0, nx1), name
+    return None
 
 
 def _supplier_block_from_columns(doc: Document) -> Tuple[Optional[str], List[str]]:

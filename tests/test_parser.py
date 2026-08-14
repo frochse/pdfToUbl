@@ -286,6 +286,69 @@ def test_a_heading_split_over_two_lines_is_read_as_one():
     assert columns["quantity"][0] < columns["description"][0]
 
 
+# A list of fields, two columns wide: labels left, values right. The supplier
+# is named outright, and its address is the value column continued downwards.
+_NAMED_SUPPLIER = [
+    [("Debiteurnummer", 45, 130), ("18288583", 132, 166)],
+    [("Leverancier", 299, 344), ("KPN B.V.", 390, 424)],
+    [("Factuuradres frochse@yahoo.com", 45, 208),
+     ("Wilhelminakade 123", 390, 465)],
+    [("Contractant FROC Holding B.V.", 45, 202),
+     ("3072 AP Rotterdam", 390, 465)],
+    [("Land In Zicht 9", 130, 188), ("KvK nummer", 299, 349),
+     ("27124701", 390, 424)],
+    [("Klantnummer", 45, 130), ("7073386584", 132, 177)],
+]
+
+
+def test_an_invoice_that_names_its_supplier_is_believed():
+    """Which block on the page is the sender is a guess; "Leverancier" is not."""
+    inv = pdfinvoice.parse(_positioned_doc(_NAMED_SUPPLIER))
+
+    assert inv.supplier.name == "KPN B.V."
+    assert inv.supplier.address == ["Wilhelminakade 123", "3072 AP Rotterdam"]
+
+
+def test_the_supplier_address_ends_where_the_next_label_begins():
+    """"27124701" under the address is the KvK value, and says nothing about
+    itself — only the label beside it does. The line above holds someone
+    else's e-mail and must not end the block either."""
+    inv = pdfinvoice.parse(_positioned_doc(_NAMED_SUPPLIER))
+
+    assert "27124701" not in " ".join(inv.supplier.address)
+    assert inv.supplier.coc_number == "27124701"
+
+
+def test_the_addressee_is_read_from_the_same_kind_of_label():
+    """"Aan | FROC Holding B.V." is the same two-column shape as the supplier,
+    and the address under it belongs to the customer."""
+    inv = pdfinvoice.parse(_positioned_doc(
+        [[("Aan", 45, 61), ("FROC Holding B.V.", 130, 202),
+          ("Factuurdatum 16 juli 2026", 299, 433)],
+         [("Land In Zicht 9", 130, 188), ("Factuurnummer 151138572", 299, 426)],
+         [("1316VJ ALMERE", 130, 192)]] + _NAMED_SUPPLIER
+    ))
+
+    assert inv.customer.name == "FROC Holding B.V."
+    assert inv.customer.address == ["Land In Zicht 9", "1316VJ ALMERE"]
+
+
+def test_an_e_mail_address_behind_a_billing_label_is_not_the_customer():
+    """KPN labels an e-mail address "Factuuradres". No company is called
+    frochse@yahoo.com, so the label is passed over."""
+    inv = pdfinvoice.parse(_positioned_doc(_NAMED_SUPPLIER))
+
+    assert inv.customer.name != "frochse@yahoo.com"
+
+
+def test_the_debtor_number_wins_from_the_customer_number():
+    """Both are printed and they are not the same number: the debtor number is
+    the account the invoice is booked against."""
+    inv = pdfinvoice.parse(_positioned_doc(_NAMED_SUPPLIER))
+
+    assert inv.customer_number == "18288583"
+
+
 def test_the_grand_total_wins_from_the_subtotals_printed_above_it():
     """A fuel card bills per vehicle, so several lines say "Totaal" before the
     one that means it. Net plus VAT settles which is which."""
